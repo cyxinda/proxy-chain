@@ -1,5 +1,3 @@
-import net from 'node:net';
-
 const TAG = '[DpsApi]';
 
 export class DpsApi {
@@ -27,7 +25,10 @@ export class DpsApi {
         this.proxyUsername = proxyUsername;
         this.proxyPassword = proxyPassword;
         this.orderKey = orderKey;
-        this.apiEndpoint = apiEndpoint || 'https://dps.kdlapi.com/api';
+        // 归一化 base URL：去掉末尾的 /getdps/ 或 /getdps
+        this.apiEndpoint = (apiEndpoint || 'https://dps.kdlapi.com/api')
+            .replace(/\/getdps\/?$/, '')
+            .replace(/\/+$/, '');
     }
 
     async getDpsIp(): Promise<{ ip: string; port: number }> {

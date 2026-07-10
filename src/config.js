@@ -1,11 +1,12 @@
-// Centralized configuration for proxy-server.
+// Centralized configuration for proxy-chain forwarder.
 // 优先级：环境变量 > Nacos 远程配置 > 本地 config.yaml > 硬编码默认值。
+// Nacos 连接参数从 bootstrap.yaml 读取（nacosClient.js 负责）。
 
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { load as yamlLoad } from 'js-yaml';
-import { fetchNacosConfig } from './nacosClient.js';
+import { fetchNacosConfig, nacosConfig } from './nacosClient.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -42,19 +43,11 @@ function loadFileConfig() {
 
 /** 加载配置：Nacos 优先，回退到本地文件 */
 async function loadRemoteOrLocal() {
-  const nacosDataId = process.env.NACOS_CONFIG_DATA_ID || 'proxy-server-dev.yaml';
-  const nacosGroup = process.env.NACOS_CONFIG_GROUP || 'DEFAULT_GROUP';
-  const nacosNamespace = process.env.NACOS_NAMESPACE || 'dev';
-  const nacosServerAddr = process.env.NACOS_SERVER_ADDR || '172.16.11.229:38848';
-
+  // nacosConfig 由 nacosClient.js 从 bootstrap.yaml + 环境变量解析
   console.log(`[config] ====== 配置加载开始 ======`);
-  console.log(`[config] Nacos 服务器: ${nacosServerAddr}`);
-  console.log(`[config] Nacos 命名空间: ${nacosNamespace || '(空/public)'}`);
-  console.log(`[config] Nacos 配置文件名: ${nacosDataId}`);
-  console.log(`[config] Nacos 分组: ${nacosGroup}`);
 
   try {
-    const remote = await fetchNacosConfig(nacosDataId, nacosGroup);
+    const remote = await fetchNacosConfig(); // 使用 bootstrap 中的 dataId/group
     if (remote && Object.keys(remote).length > 0) {
       console.log(`[config] 从 Nacos 加载配置成功，配置项: ${Object.keys(remote).join(', ')}`);
       console.log(`[config] ====== 配置加载完成 (来源: Nacos) ======`);
@@ -73,27 +66,44 @@ async function loadRemoteOrLocal() {
 const file = await loadRemoteOrLocal();
 
 // 共享凭证配置（application-dev.yml）：快代理 DPS 凭证的唯一来源。
-// 键名从 Spring 风格映射到本服务的扁平风格；凭证字段优先 shared，其次 file，最后默认值。
+// 支持双订单：short（短命池）和 long（长命池）
 async function loadSharedConfig() {
-  const sharedDataId = process.env.NACOS_SHARED_CONFIG_DATA_ID || 'application-dev.yml';
-  const nacosGroup = process.env.NACOS_CONFIG_GROUP || 'DEFAULT_GROUP';
   try {
-    const remote = await fetchNacosConfig(sharedDataId, nacosGroup);
+    const remote = await fetchNacosConfig(nacosConfig.sharedDataId, nacosConfig.sharedGroup);
     if (remote && Object.keys(remote).length > 0) {
-      console.log(`[config] 共享配置 ${sharedDataId} 加载成功`);
+      console.log(`[config] 共享配置 ${nacosConfig.sharedDataId} 加载成功`);
       return remote;
     }
-    console.log(`[config] 共享配置 ${sharedDataId} 返回空`);
+    console.log(`[config] 共享配置 ${nacosConfig.sharedDataId} 返回空`);
   } catch (err) {
-    console.warn(`[config] 共享配置 ${sharedDataId} 加载失败: ${err.message}`);
+    console.warn(`[config] 共享配置 ${nacosConfig.sharedDataId} 加载失败: ${err.message}`);
   }
   return {};
 }
 
 function mapShared(raw) {
   const root = raw || {};
+  // 支持两种格式：新的 dps-short/dps-long 和旧的 kuaidaili
+  const dpsShort = root['dps-short'] || root.dpsShort || {};
+  const dpsLong = root['dps-long'] || root.dpsLong || {};
   const k = root.kuaidaili || {};
+
   return {
+    dpsShort: {
+      apiEndpoint: dpsShort['api-endpoint'] || dpsShort.apiEndpoint,
+      secretId: dpsShort['secret-id'] || dpsShort.secretId,
+      secretKey: dpsShort['secret-key'] || dpsShort.secretKey,
+      proxyUsername: dpsShort['proxy-username'] || dpsShort.proxyUsername,
+      proxyPassword: dpsShort['proxy-password'] || dpsShort.proxyPassword,
+    },
+    dpsLong: {
+      apiEndpoint: dpsLong['api-endpoint'] || dpsLong.apiEndpoint,
+      secretId: dpsLong['secret-id'] || dpsLong.secretId,
+      secretKey: dpsLong['secret-key'] || dpsLong.secretKey,
+      proxyUsername: dpsLong['proxy-username'] || dpsLong.proxyUsername,
+      proxyPassword: dpsLong['proxy-password'] || dpsLong.proxyPassword,
+    },
+    // 旧格式兼容：kuaidaili 作为 fallback
     kuaidaili: {
       apiEndpoint: k['api-endpoint'],
       secretId: k['secret-id'],
@@ -106,22 +116,44 @@ function mapShared(raw) {
 
 const shared = mapShared(await loadSharedConfig());
 
+const fallback = shared.kuaidaili;
+
 export const config = {
   log: {
     level: str(process.env.LOG_LEVEL, file.log?.level, 'info'),
   },
-  kuaidaili: {
-    apiEndpoint: str(process.env.KUAIDAILI_API_ENDPOINT, shared.kuaidaili?.apiEndpoint ?? file.kuaidaili?.apiEndpoint, 'https://dps.kdlapi.com/api/getdps/'),
-    secretId: str(process.env.KUAIDAILI_SECRET_ID, shared.kuaidaili?.secretId ?? file.kuaidaili?.secretId, ''),
-    secretKey: str(process.env.KUAIDAILI_SECRET_KEY, shared.kuaidaili?.secretKey ?? file.kuaidaili?.secretKey, ''),
-    proxyUsername: str(process.env.KUAIDAILI_PROXY_USERNAME, shared.kuaidaili?.proxyUsername ?? file.kuaidaili?.proxyUsername, ''),
-    proxyPassword: str(process.env.KUAIDAILI_PROXY_PASSWORD, shared.kuaidaili?.proxyPassword ?? file.kuaidaili?.proxyPassword, ''),
+  dpsShort: {
+    apiEndpoint: str(process.env.DPS_SHORT_API_ENDPOINT,
+      shared.dpsShort?.apiEndpoint ?? file.dpsShort?.apiEndpoint ?? fallback?.apiEndpoint,
+      'https://dps.kdlapi.com/api'),
+    secretId: str(process.env.DPS_SHORT_SECRET_ID,
+      shared.dpsShort?.secretId ?? file.dpsShort?.secretId ?? fallback?.secretId, ''),
+    secretKey: str(process.env.DPS_SHORT_SECRET_KEY,
+      shared.dpsShort?.secretKey ?? file.dpsShort?.secretKey ?? fallback?.secretKey, ''),
+    proxyUsername: str(process.env.DPS_SHORT_PROXY_USERNAME,
+      shared.dpsShort?.proxyUsername ?? file.dpsShort?.proxyUsername ?? fallback?.proxyUsername, ''),
+    proxyPassword: str(process.env.DPS_SHORT_PROXY_PASSWORD,
+      shared.dpsShort?.proxyPassword ?? file.dpsShort?.proxyPassword ?? fallback?.proxyPassword, ''),
+  },
+  dpsLong: {
+    apiEndpoint: str(process.env.DPS_LONG_API_ENDPOINT,
+      shared.dpsLong?.apiEndpoint ?? file.dpsLong?.apiEndpoint ?? fallback?.apiEndpoint,
+      'https://dps.kdlapi.com/api'),
+    secretId: str(process.env.DPS_LONG_SECRET_ID,
+      shared.dpsLong?.secretId ?? file.dpsLong?.secretId ?? fallback?.secretId, ''),
+    secretKey: str(process.env.DPS_LONG_SECRET_KEY,
+      shared.dpsLong?.secretKey ?? file.dpsLong?.secretKey ?? fallback?.secretKey, ''),
+    proxyUsername: str(process.env.DPS_LONG_PROXY_USERNAME,
+      shared.dpsLong?.proxyUsername ?? file.dpsLong?.proxyUsername ?? fallback?.proxyUsername, ''),
+    proxyPassword: str(process.env.DPS_LONG_PROXY_PASSWORD,
+      shared.dpsLong?.proxyPassword ?? file.dpsLong?.proxyPassword ?? fallback?.proxyPassword, ''),
   },
   forwarder: {
     port: num(process.env.FORWARDER_PORT, file.forwarder?.port, 3128),
-    refreshIntervalMs: num(process.env.REFRESH_INTERVAL_MS, file.forwarder?.refreshIntervalMs, 10 * 60 * 1000),
-    tokenTtlMs: num(process.env.TOKEN_TTL_MS, file.forwarder?.tokenTtlMs, 50 * 60 * 1000),
-    idleTimeoutMs: num(process.env.IDLE_TIMEOUT_MS, file.forwarder?.idleTimeoutMs, 20 * 60 * 1000),
+    verbose: str(process.env.FORWARDER_VERBOSE, file.forwarder?.verbose, 'false') === 'true',
+    sharedTtlMs: num(process.env.SHARED_TTL_MS, file.forwarder?.sharedTtlMs, 90_000),
+    sessionTtlMs: num(process.env.SESSION_TTL_MS, file.forwarder?.sessionTtlMs, 900_000),
+    sessionFailureThreshold: num(process.env.SESSION_FAILURE_THRESHOLD, file.forwarder?.sessionFailureThreshold, 2),
   },
 };
 

@@ -12,26 +12,28 @@ class SessionEntry {
     healthStatus: 'ok' | 'checking' | 'fail' | 'dormant';
     billingPeriod: { failureCount: number; failureThreshold: number };
 
-    constructor(ip: string, port: number, targetHost: string) {
+    constructor(ip: string, port: number, targetHost: string, failureThreshold: number = 2) {
         this.ip = ip;
         this.port = port;
         this.targetHost = targetHost;
         this.acquiredAt = Date.now();
         this.lastRequestTime = Date.now();
         this.healthStatus = 'ok';
-        this.billingPeriod = { failureCount: 0, failureThreshold: 2 };
+        this.billingPeriod = { failureCount: 0, failureThreshold };
     }
 }
 
 export class SessionPool {
     private dpsApi: DpsApi;
     private ttlMs: number;
+    private failureThreshold: number;
     private sessions = new Map<string, SessionEntry>();
     private acquiring = new Map<string, Promise<SessionEntry>>(); // per-session 锁
 
-    constructor({ dpsApi, ttlMs }: { dpsApi: DpsApi; ttlMs: number }) {
+    constructor({ dpsApi, ttlMs, failureThreshold = 2 }: { dpsApi: DpsApi; ttlMs: number; failureThreshold?: number }) {
         this.dpsApi = dpsApi;
         this.ttlMs = ttlMs;
+        this.failureThreshold = failureThreshold;
     }
 
     async getOrCreate(sessionId: string, targetHost: string): Promise<SessionEntry> {
@@ -123,7 +125,7 @@ export class SessionPool {
                 const ip = await this.dpsApi.getDpsIp();
                 const healthy = await this.checkHealth(ip, targetHost);
                 if (healthy) {
-                    const entry = new SessionEntry(ip.ip, ip.port, targetHost);
+                    const entry = new SessionEntry(ip.ip, ip.port, targetHost, this.failureThreshold);
                     this.sessions.set(sessionId, entry);
                     console.log(`${TAG} ${sessionId} acquired IP ${ip.ip}:${ip.port} (attempt ${i + 1})`);
                     return entry;

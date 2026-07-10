@@ -1,0 +1,26 @@
+# proxy-chain Nacos 引导配置
+# 启动时最先加载，用于连接 Nacos 和服务注册
+# 优先级：环境变量 > 本文件 > 硬编码默认值
+
+nacos:
+  server-addr: "${NACOS_SERVER_ADDR:172.16.11.229:38848}"
+  namespace: "${NACOS_NAMESPACE:dev}"
+  username: "${NACOS_USERNAME:nacos}"
+  password: "${NACOS_PASSWORD:nacos}"
+  config:
+    data-id: "${NACOS_CONFIG_DATA_ID:proxy-chain-dev.yaml}"
+    group: "${NACOS_CONFIG_GROUP:DEFAULT_GROUP}"
+    shared-data-id: "${NACOS_SHARED_CONFIG_DATA_ID:application-dev.yml}"
+    shared-group: "${NACOS_SHARED_CONFIG_GROUP:DEFAULT_GROUP}"
+  discovery:
+    service-name: "${NACOS_SERVICE_NAME:proxy-chain}"
+
+# ── 环境变量说明 ──
+# NACOS_SERVER_ADDR    Nacos 服务器地址
+# NACOS_NAMESPACE      命名空间
+# NACOS_USERNAME       用户名
+# NACOS_PASSWORD       密码
+# NACOS_CONFIG_DATA_ID 服务配置文件名
+# NACOS_CONFIG_GROUP   配置分组
+# NACOS_SHARED_CONFIG_DATA_ID 共享凭证配置文件名
+# NACOS_SERVICE_NAME   注册到 Nacos 的服务名

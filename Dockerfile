@@ -12,6 +12,7 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --production
 COPY --from=builder /app/dist/ dist/
+COPY config.yaml* ./ 
 ENV NODE_ENV=production
 ENV FORWARDER_PORT=3128
 EXPOSE 3128
