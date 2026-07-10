@@ -6,11 +6,11 @@ FROM node:22-bookworm-slim AS deps-layer
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
+RUN npm config set registry https://registry.npmmirror.com && \
+    npm config set audit false && \
+    npm config set fund false
 
-RUN npm config set registry https://registry.npmmirror.com/ && \
-    npm config set audit false --global && \
-    npm config set fund false --global
+COPY package.json package-lock.json* ./
 
 ENV NPM_CONFIG_CACHE=/root/.npm
 
