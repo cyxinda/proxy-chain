@@ -86,6 +86,7 @@ function getLocalIp(): string {
 const server = new Server({
     port: PORT,
     verbose: VERBOSE,
+    healthCheckPath: '/healthz',
     prepareRequestFunction: async ({ username, hostname, port, isHttp }) => {
         try {
             const target = `${hostname}:${port}`;

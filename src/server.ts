@@ -114,6 +114,7 @@ type ServerOptionsBase = {
     prepareRequestFunction?: PrepareRequestFunction;
     verbose?: boolean;
     authRealm?: unknown;
+    healthCheckPath?: string;
 };
 
 export type HttpServerOptions = ServerOptionsBase & {
@@ -144,6 +145,8 @@ export class Server extends EventEmitter {
     authRealm: unknown;
 
     verbose: boolean;
+
+    healthCheckPath?: string;
 
     server: http.Server | https.Server;
 
@@ -205,6 +208,7 @@ export class Server extends EventEmitter {
         this.prepareRequestFunction = options.prepareRequestFunction;
         this.authRealm = options.authRealm || DEFAULT_AUTH_REALM;
         this.verbose = !!options.verbose;
+        this.healthCheckPath = options.healthCheckPath;
 
         // Keep legacy behavior (http) as default behavior.
         this.serverType = options.serverType === 'https' ? 'https' : 'http';
@@ -362,6 +366,18 @@ export class Server extends EventEmitter {
      */
     async onRequest(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
         try {
+            // Health-check endpoint: respond directly without proxying.
+            // Probes send a plain origin-form request (e.g. "GET /healthz"),
+            // which is not a valid absolute proxy URL, so handle it up front.
+            if (this.healthCheckPath && request.method === 'GET') {
+                const path = (request.url || '').split('?')[0];
+                if (path === this.healthCheckPath) {
+                    response.writeHead(200, { 'Content-Type': 'text/plain' });
+                    response.end('OK');
+                    return;
+                }
+            }
+
             const handlerOpts = await this.prepareRequestHandling(request);
             handlerOpts.srcResponse = response;
 
