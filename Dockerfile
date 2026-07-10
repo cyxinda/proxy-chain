@@ -1,4 +1,4 @@
-# proxy-chain Dockerfile — 基于 proxy-chain v3.0.0 源码二次开发
+# proxy-chain Dockerfile — 预编译模式（本地 tsc 编译，Docker 内不编译）
 # ============================================================
 # Stage 1: Git clone (SSH)
 # ============================================================
@@ -30,69 +30,27 @@ RUN --mount=type=ssh,id=git_ssh_key \
     echo "Latest commits:" && git log -4 --oneline
 
 # ============================================================
-# Stage 2: 仅安装 TypeScript 编译依赖（含 dev，跳过 postinstall 脚本）
+# Stage 2: 仅安装生产依赖
 # ============================================================
 FROM node:22-bookworm-slim AS deps-layer
 
-ARG HTTP_PROXY=""
-ARG HTTPS_PROXY=""
-
-ENV PNPM_HOME=/pnpm \
-    PATH=/pnpm:$PATH
-
-RUN corepack enable
-
 WORKDIR /app
 
-COPY --from=git-layer /data/package.json /data/pnpm-lock.yaml* /data/pnpm-workspace.yaml* ./
+COPY --from=git-layer /data/package.json /data/pnpm-lock.yaml* ./
+COPY package.json pnpm-lock.yaml* ./
 
-RUN pnpm config set registry https://registry.npmmirror.com/ && \
-    pnpm config set store-dir /pnpm/store
+RUN npm config set registry https://registry.npmmirror.com/ && \
+    npm config set audit false --global && \
+    npm config set fund false --global
 
-RUN --mount=type=cache,target=/pnpm/store,id=pnpm-store-proxy-chain \
-    echo "开始安装编译依赖..." && \
-    pnpm install --no-frozen-lockfile --ignore-scripts && \
-    echo "编译依赖安装完成"
+ENV NPM_CONFIG_CACHE=/root/.npm
 
-# ============================================================
-# Stage 3: TypeScript 编译
-# ============================================================
-FROM deps-layer AS build-layer
-
-COPY --from=git-layer /data/ ./
-COPY . .
-
-RUN pnpm exec tsc
-
-# ============================================================
-# Stage 4: 仅安装生产依赖
-# ============================================================
-FROM node:22-bookworm-slim AS prod-deps-layer
-
-ARG HTTP_PROXY=""
-ARG HTTPS_PROXY=""
-
-ENV HTTP_PROXY=$HTTP_PROXY \
-    HTTPS_PROXY=$HTTPS_PROXY \
-    PNPM_HOME=/pnpm \
-    PATH=/pnpm:$PATH
-
-RUN corepack enable
-
-WORKDIR /app
-
-COPY --from=git-layer /data/package.json /data/pnpm-lock.yaml* /data/pnpm-workspace.yaml* ./
-
-RUN pnpm config set registry https://registry.npmmirror.com/ && \
-    pnpm config set store-dir /pnpm/store
-
-RUN --mount=type=cache,target=/pnpm/store,id=pnpm-store-proxy-chain-prod \
-    echo "开始安装生产依赖..." && \
-    pnpm install --prod --no-frozen-lockfile --ignore-scripts && \
+RUN echo "开始安装生产依赖..." && \
+    npm install --omit=dev --ignore-scripts && \
     echo "生产依赖安装完成"
 
 # ============================================================
-# Stage 5: 运行时
+# Stage 3: 运行时
 # ============================================================
 FROM node:22-bookworm-slim AS runtime-layer
 
@@ -112,9 +70,9 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 WORKDIR /app
 
-COPY --from=prod-deps-layer /app/node_modules ./node_modules
-COPY --from=build-layer /app/dist/ dist/
-COPY . .
+COPY --from=deps-layer /app/node_modules ./node_modules
+COPY dist/ dist/
+COPY config.yaml ./
 
 EXPOSE 3128
 
