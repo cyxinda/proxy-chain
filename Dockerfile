@@ -5,7 +5,7 @@
 FROM alpine/git:v2.49.1 AS git-layer
 
 ARG GIT_REPO_URL=git@github.com:cyxinda/proxy-chain.git
-ARG GIT_TAG=dev
+ARG GIT_TAG=master
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
 ARG NO_PROXY="localhost,127.0.0.1"
@@ -30,25 +30,29 @@ RUN --mount=type=ssh,id=git_ssh_key \
     echo "Latest commits:" && git log -4 --oneline
 
 # ============================================================
-# Stage 2: 依赖安装（含 devDependencies，用于 TypeScript 编译）
+# Stage 2: 仅安装 TypeScript 编译依赖（含 dev，跳过 postinstall 脚本）
 # ============================================================
 FROM node:22-bookworm-slim AS deps-layer
 
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+
+ENV PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH
+
+RUN corepack enable
+
 WORKDIR /app
 
-COPY --from=git-layer /data/package.json /data/package-lock.json* ./
-COPY package.json package-lock.json* ./
+COPY --from=git-layer /data/package.json /data/pnpm-lock.yaml* /data/pnpm-workspace.yaml* ./
 
-RUN npm config set registry https://registry.npmmirror.com/ && \
-    npm config set audit false --global && \
-    npm config set fund false --global
+RUN pnpm config set registry https://registry.npmmirror.com/ && \
+    pnpm config set store-dir /pnpm/store
 
-ENV NPM_CONFIG_CACHE=/root/.npm
-
-RUN --mount=type=cache,target=/root/.npm,id=npm-cache-proxy-chain \
-    echo "开始安装依赖..." && \
-    npm install && \
-    echo "依赖安装完成"
+RUN --mount=type=cache,target=/pnpm/store,id=pnpm-store-proxy-chain \
+    echo "开始安装编译依赖..." && \
+    pnpm install --no-frozen-lockfile --ignore-scripts && \
+    echo "编译依赖安装完成"
 
 # ============================================================
 # Stage 3: TypeScript 编译
@@ -58,15 +62,39 @@ FROM deps-layer AS build-layer
 COPY --from=git-layer /data/ ./
 COPY . .
 
-RUN npx tsc
+RUN pnpm exec tsc
 
 # ============================================================
-# Stage 4: 运行时
+# Stage 4: 仅安装生产依赖
 # ============================================================
-FROM node:22-bookworm-slim AS runtime-layer
+FROM node:22-bookworm-slim AS prod-deps-layer
 
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
+
+ENV HTTP_PROXY=$HTTP_PROXY \
+    HTTPS_PROXY=$HTTPS_PROXY \
+    PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH
+
+RUN corepack enable
+
+WORKDIR /app
+
+COPY --from=git-layer /data/package.json /data/pnpm-lock.yaml* /data/pnpm-workspace.yaml* ./
+
+RUN pnpm config set registry https://registry.npmmirror.com/ && \
+    pnpm config set store-dir /pnpm/store
+
+RUN --mount=type=cache,target=/pnpm/store,id=pnpm-store-proxy-chain-prod \
+    echo "开始安装生产依赖..." && \
+    pnpm install --prod --no-frozen-lockfile --ignore-scripts && \
+    echo "生产依赖安装完成"
+
+# ============================================================
+# Stage 5: 运行时
+# ============================================================
+FROM node:22-bookworm-slim AS runtime-layer
 
 RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
     sed -i 's|http://security.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
@@ -84,8 +112,8 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 WORKDIR /app
 
+COPY --from=prod-deps-layer /app/node_modules ./node_modules
 COPY --from=build-layer /app/dist/ dist/
-COPY --from=build-layer /app/node_modules ./node_modules
 COPY . .
 
 EXPOSE 3128
