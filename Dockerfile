@@ -4,7 +4,7 @@
 # ============================================================
 FROM alpine/git:v2.49.1 AS git-layer
 
-ARG GIT_REPO=git@github.com:cyxinda/proxy-chain.git
+ARG GIT_REPO_URL=git@github.com:cyxinda/proxy-chain.git
 ARG GIT_TAG=dev
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
@@ -14,19 +14,19 @@ ARG CACHEBUST=1
 WORKDIR /data
 
 RUN --mount=type=ssh,id=git_ssh_key \
-    if [ -z "${GIT_REPO}" ]; then \
-        echo "GIT_REPO is empty, skipping git clone"; \
+    if [ -z "${GIT_REPO_URL}" ]; then \
+        echo "GIT_REPO_URL is empty, skipping git clone"; \
         echo '{"name":"proxy-chain","private":true}' > /data/package.json; \
         exit 0; \
     fi && \
     echo "CACHEBUST=${CACHEBUST}" > /dev/null && \
     mkdir -p -m 0700 ~/.ssh && \
-    HOST=$(echo "${GIT_REPO}" | sed -n 's|.*@\([^:/]*\).*|\1|p') && \
+    HOST=$(echo "${GIT_REPO_URL}" | sed -n 's|.*@\([^:/]*\).*|\1|p') && \
     ssh-keyscan "${HOST}" >> ~/.ssh/known_hosts 2>/dev/null && \
     export HTTP_PROXY="$HTTP_PROXY" HTTPS_PROXY="$HTTPS_PROXY" NO_PROXY="$NO_PROXY" \
            http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY" no_proxy="$NO_PROXY" && \
     rm -rf /data/* && \
-    git clone --depth 1 --branch ${GIT_TAG} ${GIT_REPO} . && \
+    git clone --depth 1 --branch ${GIT_TAG} ${GIT_REPO_URL} . && \
     echo "Latest commits:" && git log -4 --oneline
 
 # ============================================================
