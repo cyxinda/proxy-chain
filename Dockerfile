@@ -1,10 +1,11 @@
-# proxy-chain Dockerfile — 预编译模式（本地 tsc 编译，Docker 内不编译）
+# proxy-chain Dockerfile — 容器内编译（源码/依赖/编译全部在镜像内产出，不依赖本地 dist）
 # ============================================================
 # Stage 1: Git clone (SSH)
 # ============================================================
 FROM alpine/git:v2.49.1 AS git-layer
 
-ARG GIT_REPO_URL=git@github.com:cyxinda/proxy-chain.git
+ARG GIT_REPO=git@github.com:cyxinda/proxy-chain.git
+ARG GIT_REPO_URL=${GIT_REPO}
 ARG GIT_TAG=master
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
@@ -30,27 +31,73 @@ RUN --mount=type=ssh,id=git_ssh_key \
     echo "Latest commits:" && git log -4 --oneline
 
 # ============================================================
-# Stage 2: 仅安装生产依赖
+# Stage 2: 安装全部依赖（含 dev，供 TypeScript 编译，跳过 postinstall）
 # ============================================================
 FROM node:22-bookworm-slim AS deps-layer
 
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+
+ENV HTTP_PROXY=$HTTP_PROXY \
+    HTTPS_PROXY=$HTTPS_PROXY \
+    PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH
+
+RUN corepack enable
+
 WORKDIR /app
 
-COPY --from=git-layer /data/package.json /data/pnpm-lock.yaml* ./
-COPY package.json pnpm-lock.yaml* ./
+COPY --from=git-layer /data/package.json /data/pnpm-lock.yaml* /data/pnpm-workspace.yaml* ./
 
-RUN npm config set registry https://registry.npmmirror.com/ && \
-    npm config set audit false --global && \
-    npm config set fund false --global
+RUN pnpm config set registry https://registry.npmmirror.com/ && \
+    pnpm config set store-dir /pnpm/store
 
-ENV NPM_CONFIG_CACHE=/root/.npm
+RUN --mount=type=cache,target=/pnpm/store,id=pnpm-store-proxy-chain \
+    echo "开始安装编译依赖..." && \
+    pnpm install --no-frozen-lockfile --ignore-scripts && \
+    echo "编译依赖安装完成"
 
-RUN echo "开始安装生产依赖..." && \
-    npm install --omit=dev --ignore-scripts && \
+# ============================================================
+# Stage 3: TypeScript 编译（源码来自 git-layer）
+# ============================================================
+FROM deps-layer AS build-layer
+
+COPY --from=git-layer /data/ ./
+
+# tsc 不编译纯 JS 源文件（未开 allowJs），需手动同步 src 下的 .js 到 dist
+RUN pnpm exec tsc && \
+    find src -name '*.js' -exec sh -c 'mkdir -p "dist/$(dirname "$1")" && cp "$1" "dist/$1"' _ {} \; && \
+    ls -l dist/forwarder.js dist/src/config.js dist/src/nacosClient.js
+
+# ============================================================
+# Stage 4: 仅安装生产依赖
+# ============================================================
+FROM node:22-bookworm-slim AS prod-deps-layer
+
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+
+ENV HTTP_PROXY=$HTTP_PROXY \
+    HTTPS_PROXY=$HTTPS_PROXY \
+    PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH
+
+RUN corepack enable
+
+WORKDIR /app
+
+COPY --from=git-layer /data/package.json /data/pnpm-lock.yaml* /data/pnpm-workspace.yaml* ./
+
+RUN pnpm config set registry https://registry.npmmirror.com/ && \
+    pnpm config set store-dir /pnpm/store
+
+RUN --mount=type=cache,target=/pnpm/store,id=pnpm-store-proxy-chain-prod \
+    echo "开始安装生产依赖..." && \
+    pnpm install --prod --no-frozen-lockfile --ignore-scripts && \
     echo "生产依赖安装完成"
 
 # ============================================================
-# Stage 3: 运行时
+# Stage 5: 运行时
 # ============================================================
 FROM node:22-bookworm-slim AS runtime-layer
 
@@ -70,9 +117,9 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 WORKDIR /app
 
-COPY --from=deps-layer /app/node_modules ./node_modules
-COPY dist/ dist/
-COPY config.yaml ./
+COPY --from=prod-deps-layer /app/node_modules ./node_modules
+COPY --from=build-layer /app/dist/ dist/
+COPY --from=git-layer /data/config.yaml ./
 
 EXPOSE 3128
 
