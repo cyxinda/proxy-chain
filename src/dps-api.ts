@@ -32,6 +32,10 @@ export class DpsApi {
     }
 
     async getDpsIp(): Promise<{ ip: string; port: number }> {
+        return this._getDpsIp(0);
+    }
+
+    private async _getDpsIp(retry: number): Promise<{ ip: string; port: number }> {
         const token = await this.ensureToken();
         const url = `${this.apiEndpoint}/getdps`;
         const params = new URLSearchParams({
@@ -54,7 +58,7 @@ export class DpsApi {
             const text = (await res.text()).trim();
 
             if (!res.ok) {
-                if (/signature|token/i.test(text)) this.secretToken = null;
+                if (/signature|token|expired/i.test(text)) this.secretToken = null;
                 throw new Error(`getdps HTTP ${res.status} body=${truncate(text)}`);
             }
 
@@ -68,6 +72,16 @@ export class DpsApi {
                 } catch (e: any) {
                     if (e.code != null) throw e;
                 }
+            }
+
+            // 纯文本错误（如 "ERROR(-107): secret_token expired: xxx"）
+            // 之前只检查 JSON 格式的 token 错误，纯文本的 token 过期没有重置 secretToken，
+            // 导致后续请求继续用过期 token，反复失败。检测到 token 过期后重置并重试一次。
+            if (/ERROR.*token.*expired|secret_token.*expired|signature.*invalid/i.test(text)) {
+                if (retry >= 1) throw new Error(`getdps token still expired after refresh: ${truncate(text)}`);
+                console.warn(`${TAG}[${this.orderKey}] token expired, refreshing and retrying`);
+                this.secretToken = null;
+                return this._getDpsIp(retry + 1);
             }
 
             const m = /^([0-9.]+):(\d+)$/.exec(text.split(/\s+/)[0]);
