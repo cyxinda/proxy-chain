@@ -1,20 +1,17 @@
 /**
- * Unified DPS proxy forwarder v4
+ * DPS proxy forwarder - Simple single IP mode
  *
- * 共享 IP 池方案：所有 host 共享 IP 池，被封锁时快速轮换。
+ * Simple single IP management for web-archiver.
+ * Uses one IP until it dies, then gets a new one.
+ * Session mode for web-collector remains unchanged.
  *
- * 配置来源：环境变量 > Nacos > 本地 config.yaml > 默认值
- *
- * 双模式:
- *   - shared (无 auth): 共享 IP 池, 供 web-archiver
- *   - session (有 auth): per-session sticky 长命 IP, 供 web-collector
+ * Config: env vars > Nacos > local config.yaml > defaults
  */
 
 import os from 'node:os';
 import http from 'node:http';
 import { Server } from './src/server.js';
 import { DpsApi } from './src/dps-api.js';
-import { SharedPool } from './src/shared-pool.js';
 import { SessionPool } from './src/session-pool.js';
 // @ts-ignore
 import { config } from './src/config.js';
@@ -27,7 +24,6 @@ const PORT = config.forwarder.port;
 const SHARED_TTL_MS = config.forwarder.sharedTtlMs;
 const SESSION_TTL_MS = config.forwarder.sessionTtlMs;
 const VERBOSE = config.forwarder.verbose;
-const INTERNAL_PORT = config.forwarder.internalPort ?? 3129;
 
 // ── DPS API ──
 
@@ -54,15 +50,44 @@ const SHORT_PROXY_PASS = config.dpsShort.proxyPassword;
 const LONG_PROXY_USER = config.dpsLong.proxyUsername;
 const LONG_PROXY_PASS = config.dpsLong.proxyPassword;
 
-// ── 共享 IP 池 ──
+// ── Single IP state ──
 
-const sharedPool = new SharedPool({
-    dpsApi: dpsApiShort,
-    ttlMs: SHARED_TTL_MS,
-    poolSize: config.forwarder.poolSize ?? 10,
-    refillThreshold: config.forwarder.refillThreshold ?? 3,
-    blockedIpTtlMs: config.forwarder.blockedIpTtlMs ?? 600_000,
-});
+let currentIp: { ip: string; port: number; acquiredAt: number } | null = null;
+let ipPromise: Promise<{ ip: string; port: number }> | null = null;
+
+async function getSharedIp(): Promise<{ ip: string; port: number }> {
+    // Return existing IP if valid
+    if (currentIp && Date.now() - currentIp.acquiredAt < SHARED_TTL_MS) {
+        return currentIp;
+    }
+
+    // Dedup concurrent requests
+    if (ipPromise) return ipPromise;
+
+    ipPromise = (async () => {
+        // Get new IP from DPS API
+        const ips = await dpsApiShort.getDpsIps(1);
+        if (!ips || ips.length === 0) throw new Error('DPS API: no IP returned');
+        currentIp = { ip: ips[0].ip, port: ips[0].port, acquiredAt: Date.now() };
+        console.log(`${TAG} [shared] new IP ${currentIp.ip}:${currentIp.port}`);
+        return currentIp;
+    })();
+
+    try {
+        return await ipPromise;
+    } finally {
+        ipPromise = null;
+    }
+}
+
+function invalidateSharedIp(): void {
+    if (currentIp) {
+        console.log(`${TAG} [shared] invalidated IP ${currentIp.ip}:${currentIp.port}`);
+        currentIp = null;
+    }
+}
+
+// ── Session pool (for web-collector) ──
 
 const sessionPool = new SessionPool({
     dpsApi: dpsApiLong,
@@ -70,7 +95,7 @@ const sessionPool = new SessionPool({
     failureThreshold: config.forwarder.sessionFailureThreshold,
 });
 
-// ── 获取本机 IP ──
+// ── Get local IP ──
 
 function getLocalIp(): string {
     for (const ifaces of Object.values(os.networkInterfaces())) {
@@ -91,17 +116,17 @@ const server = new Server({
     prepareRequestFunction: async ({ username, hostname, port, isHttp }) => {
         try {
             const target = `${hostname}:${port}`;
+
             if (!username) {
-                // Shared 模式：从共享池获取 IP（跳过被该 host 封锁的 IP）
-                const ip = await sharedPool.acquireForHost(hostname);
-                if (!ip) throw new Error('SharedPool: no IP available for ' + hostname);
+                // Shared mode: single IP for all hosts
+                const ip = await getSharedIp();
                 console.log(`${TAG} [shared] ${isHttp ? 'HTTP' : 'CONNECT'} ${target} via ${ip.ip}:${ip.port}`);
                 return {
                     upstreamProxyUrl: `http://${SHORT_PROXY_USER}:${SHORT_PROXY_PASS}@${ip.ip}:${ip.port}`,
-                    customTag: { mode: 'shared' as const, host: hostname, ip: ip.ip },
+                    customTag: { mode: 'shared' as const },
                 };
             } else {
-                // Session 模式
+                // Session mode: sticky IP per session
                 const entry = await sessionPool.getOrCreate(username, hostname);
                 sessionPool.touchLastRequest(username);
                 console.log(`${TAG} [session:${username}] ${isHttp ? 'HTTP' : 'CONNECT'} ${target} via ${entry.ip}:${entry.port}`);
@@ -117,16 +142,12 @@ const server = new Server({
     },
 });
 
-// ── tunnelConnectFailed：CONNECT 隧道失败时删除死 IP ──
+// ── tunnelConnectFailed: invalidate dead IP ──
 
-server.on('tunnelConnectFailed', async ({ customTag }: { customTag?: { mode: string; id?: string; host?: string; ip?: string } }) => {
+server.on('tunnelConnectFailed', async ({ customTag }: { customTag?: { mode: string; id?: string } }) => {
     try {
-        if (customTag?.mode === 'shared' && customTag.ip) {
-            // TCP/TLS 层失败：从池中删除死 IP（不只是标记封锁）
-            const port = parseInt(customTag.ip.split(':')[1] || '0');
-            const ipOnly = customTag.ip.split(':')[0];
-            sharedPool.removeIp(ipOnly, port || 0);
-            console.log(`${TAG} tunnelConnectFailed: removed IP ${customTag.ip}`);
+        if (customTag?.mode === 'shared') {
+            invalidateSharedIp();
         } else if (customTag?.mode === 'session' && customTag.id) {
             await sessionPool.recordFailure(customTag.id);
         }
@@ -135,59 +156,38 @@ server.on('tunnelConnectFailed', async ({ customTag }: { customTag?: { mode: str
     }
 });
 
-// ── 流量统计 ──
+// ── Connection stats ──
 
 server.on('connectionClosed', ({ connectionId, stats }: { connectionId: number; stats: any }) => {
     console.log(`${TAG} [${connectionId}] srcTx=${stats.srcTxBytes} srcRx=${stats.srcRxBytes} trgTx=${stats.trgTxBytes} trgRx=${stats.trgRxBytes}`);
 });
 
-// ── 内部 HTTP 端点 ──
+// ── Status endpoint for web-archiver ──
 
-const internalServer = http.createServer(async (req, res) => {
-    if (req.method === 'GET' && req.url === '/healthz') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('OK');
+const statusServer = http.createServer((req, res) => {
+    if (req.url === '/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ip: currentIp?.ip || null,
+            port: currentIp?.port || null,
+            acquiredAt: currentIp?.acquiredAt || null,
+        }));
         return;
     }
-
-    if (req.method === 'POST' && req.url === '/internal/invalidate') {
-        try {
-            const chunks: Buffer[] = [];
-            for await (const chunk of req) chunks.push(chunk as Buffer);
-            const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-            if (!body.host) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: false, error: 'host is required' }));
-                return;
-            }
-            sharedPool.invalidateHost(body.host, body.ip);
-            console.log(`${TAG} [internal] blocked host=${body.host} ip=${body.ip ?? '(all)'} reason=${body.reason ?? '(none)'}`);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true }));
-        } catch (err: any) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: err.message }));
-        }
-        return;
-    }
-
     res.writeHead(404);
     res.end();
 });
 
-internalServer.listen(INTERNAL_PORT, () => {
-    console.log(`${TAG} internal HTTP server listening on :${INTERNAL_PORT}`);
+statusServer.listen(PORT, () => {
+    console.log(`${TAG} status endpoint on :${PORT}/status`);
 });
 
-// ── 启动 ──
+// ── Start ──
 
 await server.listen();
 console.log(`${TAG} listening on :${server.port}`);
 console.log(`${TAG} shared TTL=${SHARED_TTL_MS}ms, session TTL=${SESSION_TTL_MS}ms`);
-console.log(`${TAG} poolSize=${config.forwarder.poolSize ?? 10}, internalPort=${INTERNAL_PORT}`);
 
-sharedPool.startIdleMonitor();
-sharedPool.startHealthChecker();
 sessionPool.startIdleMonitor();
 sessionPool.startHealthChecker();
 
@@ -196,7 +196,7 @@ registerService(nacosConfig.serviceName, localIp, PORT).catch(() => {});
 
 const shutdown = async () => {
     console.log(`${TAG} shutting down...`);
-    internalServer.close();
+    statusServer.close();
     await deregisterService(nacosConfig.serviceName, localIp, PORT).catch(() => {});
     await server.close(true);
     process.exit(0);

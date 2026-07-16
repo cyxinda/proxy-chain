@@ -1,4 +1,4 @@
-# proxy-chain forwarder 本地配置（Nacos 不可用时的 fallback）
+# proxy-chain forwarder 本地配置
 # 优先级：环境变量 > Nacos 远程配置 > 本文件 > 硬编码默认值
 
 log:
@@ -9,15 +9,9 @@ forwarder:
   verbose: false
   sharedTtlMs: 90000      # 短命池 TTL 1.5min
   sessionTtlMs: 900000    # 长命池 TTL 15min
-  sessionFailureThreshold: 2  # 长命池账期失败阈值，>=此值直接删除 IP
-  poolSize: 10              # 共享 IP 池大小
-  refillThreshold: 3        # 池中 IP 低于此值时触发补充
-  maxRetryAttempts: 30      # 诊断模式：每个 host 尝试最多 30 个 IP
-  blockedIpTtlMs: 600000    # host+IP 封锁标记 TTL (10min，对齐网站解封周期)
-  internalPort: 3129        # 内部 HTTP 端口 (接收 web-archiver 封锁反馈)
-  maxConcurrentAcquire: 3   # IP 获取并发限制 (防止缓冲池被瞬间耗尽)
+  sessionFailureThreshold: 2
 
-# DPS 短命池订单（Nacos 共享配置 application-dev.yml 中 dps-short 段）
+# DPS 短命池订单
 # dpsShort:
 #   apiEndpoint: https://dps.kdlapi.com/api
 #   secretId: xxx
@@ -25,7 +19,7 @@ forwarder:
 #   proxyUsername: xxx
 #   proxyPassword: xxx
 
-# DPS 长命池订单（Nacos 共享配置 application-dev.yml 中 dps-long 段）
+# DPS 长命池订单
 # dpsLong:
 #   apiEndpoint: https://dps.kdlapi.com/api
 #   secretId: xxx

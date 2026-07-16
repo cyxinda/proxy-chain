@@ -154,10 +154,6 @@ export const config = {
     sharedTtlMs: num(process.env.SHARED_TTL_MS, file.forwarder?.sharedTtlMs, 90_000),
     sessionTtlMs: num(process.env.SESSION_TTL_MS, file.forwarder?.sessionTtlMs, 900_000),
     sessionFailureThreshold: num(process.env.SESSION_FAILURE_THRESHOLD, file.forwarder?.sessionFailureThreshold, 2),
-    poolSize: num(process.env.POOL_SIZE, file.forwarder?.poolSize, 10),
-    refillThreshold: num(process.env.REFILL_THRESHOLD, file.forwarder?.refillThreshold, 3),
-    blockedIpTtlMs: num(process.env.BLOCKED_IP_TTL_MS, file.forwarder?.blockedIpTtlMs, 600_000),
-    internalPort: num(process.env.INTERNAL_PORT, file.forwarder?.internalPort, 3129),
   },
 };
 

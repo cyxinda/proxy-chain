@@ -8,5 +8,4 @@ export type { CustomResponse } from './custom_response.js';
 
 // DPS 扩展模块
 export { DpsApi } from './dps-api.js';
-export { SharedPool } from './shared-pool.js';
 export { SessionPool } from './session-pool.js';
