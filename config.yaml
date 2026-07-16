@@ -10,8 +10,8 @@ forwarder:
   sharedTtlMs: 90000      # 短命池 TTL 1.5min
   sessionTtlMs: 900000    # 长命池 TTL 15min
   sessionFailureThreshold: 2  # 长命池账期失败阈值，>=此值直接删除 IP
-  bufferSize: 30            # 诊断模式：缓冲池 30 个 IP
-  bufferRefillThreshold: 5  # 缓冲池低于此值时触发批量获取
+  poolSize: 10              # 共享 IP 池大小
+  refillThreshold: 3        # 池中 IP 低于此值时触发补充
   maxRetryAttempts: 30      # 诊断模式：每个 host 尝试最多 30 个 IP
   blockedIpTtlMs: 600000    # host+IP 封锁标记 TTL (10min，对齐网站解封周期)
   internalPort: 3129        # 内部 HTTP 端口 (接收 web-archiver 封锁反馈)

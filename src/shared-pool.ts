@@ -9,124 +9,107 @@ interface CachedIp {
     acquiredAt: number;
 }
 
-interface HostEntry extends CachedIp {
-    lastRequestTime: number;
-}
-
-interface PendingInvalidation {
-    host: string;
-    ip: string;
-    reason: string;
-    queuedAt: number;
-}
-
 export class SharedPool {
     private dpsApi: DpsApi;
     private ttlMs: number;
-    private bufferSize: number;
-    private bufferRefillThreshold: number;
+    private poolSize: number;
+    private refillThreshold: number;
     private blockedIpTtlMs: number;
 
-    private hostIps = new Map<string, HostEntry>();
-    private bufferPool: CachedIp[] = [];
+    // IP 共享池：所有 host 共用
+    private ipPool: CachedIp[] = [];
+    // 被封锁的 host+IP 组合（10min TTL）
     private blockedIps = new Map<string, number>();
 
     private refillPromise: Promise<void> | null = null;
-    private acquiring = new Map<string, Promise<CachedIp | null>>();
-
     private dpsBackoffUntil = 0;
     private ipExtractHistory: number[] = [];
 
-    // 待删除队列：DPS 退避期间暂存的失效 IP，退避结束后处理
-    private pendingInvalidations: PendingInvalidation[] = [];
-
-    constructor({ dpsApi, ttlMs, bufferSize = 30, bufferRefillThreshold = 5, blockedIpTtlMs = 600_000 }: {
+    constructor({ dpsApi, ttlMs, poolSize = 10, refillThreshold = 3, blockedIpTtlMs = 600_000 }: {
         dpsApi: DpsApi;
         ttlMs: number;
-        bufferSize?: number;
-        bufferRefillThreshold?: number;
+        poolSize?: number;
+        refillThreshold?: number;
         blockedIpTtlMs?: number;
     }) {
         this.dpsApi = dpsApi;
         this.ttlMs = ttlMs;
-        this.bufferSize = bufferSize;
-        this.bufferRefillThreshold = bufferRefillThreshold;
+        this.poolSize = poolSize;
+        this.refillThreshold = refillThreshold;
         this.blockedIpTtlMs = blockedIpTtlMs;
     }
 
+    /**
+     * 获取一个可用 IP 给指定 host
+     * - 从共享池中取一个未过期、未被该 host 封锁的 IP
+     * - 池空时自动补充
+     * - 所有 host 共享同一个 IP 池
+     */
     async acquireForHost(host: string): Promise<CachedIp | null> {
-        const entry = this.hostIps.get(host);
-        if (entry && (!this.isExpired(entry) || !this.canCallDps())) {
-            // 有效期内直接返回；退避期间即使过期也继续使用（无法获取新 IP）
-            entry.lastRequestTime = Date.now();
-            return entry;
+        // 1. 清理过期 IP
+        this.removeExpiredIps();
+
+        // 2. 从池中找一个未被该 host 封锁的 IP
+        let ip = this.findAvailableIp(host);
+        if (ip) return ip;
+
+        // 3. 池空或所有 IP 都被该 host 封锁 → 补充
+        await this.refillPool();
+        ip = this.findAvailableIp(host);
+        if (ip) return ip;
+
+        // 4. 补充后仍无可用 IP → 尝试复用过期 IP
+        ip = this.findExpiredIp(host);
+        if (ip) {
+            console.log(`${TAG} reusing expired IP ${ip.ip}:${ip.port} for ${host}`);
+            return ip;
         }
 
-        if (this.acquiring.has(host)) {
-            return this.acquiring.get(host)!;
-        }
-
-        const promise = this.acquireNewForHost(host);
-        this.acquiring.set(host, promise);
-        try {
-            return await promise;
-        } finally {
-            this.acquiring.delete(host);
-        }
-    }
-
-    touchLastRequest(host: string): void {
-        const entry = this.hostIps.get(host);
-        if (entry) entry.lastRequestTime = Date.now();
-    }
-
-    bindHostIp(host: string, ip: CachedIp): void {
-        this.hostIps.set(host, { ...ip, lastRequestTime: Date.now() });
-    }
-
-    popFromBufferPool(host: string): CachedIp | null {
-        const kept: CachedIp[] = [];
-        const expired: CachedIp[] = [];
-        let result: CachedIp | null = null;
-        while (this.bufferPool.length > 0) {
-            const ip = this.bufferPool.shift()!;
-            if (this.isExpired(ip)) {
-                expired.push(ip);
-            } else if (!result && !this.isBlocked(host, ip.ip)) {
-                result = ip;
-            } else {
-                kept.push(ip);
-            }
-        }
-        // 如果没有可用的未过期 IP, 尝试过期 IP (复用一次)
-        if (!result && expired.length > 0) {
-            for (const ip of expired) {
-                if (!this.isBlocked(host, ip.ip)) {
-                    result = ip;
-                    console.log(`${TAG} reusing expired IP ${ip.ip}:${ip.port} for ${host} (age=${Math.round((Date.now() - ip.acquiredAt) / 1000)}s)`);
-                    break;
-                }
-                kept.push(ip);
-            }
-        }
-        if (!result) {
-            kept.push(...expired.filter(ip => !kept.includes(ip)));
-        }
-        this.bufferPool.push(...kept);
-        return result;
-    }
-
-    getAnyAvailableIp(host: string): CachedIp | null {
-        const dpsBackoff = !this.canCallDps();
-        for (const [, entry] of this.hostIps) {
-            if (!dpsBackoff && this.isExpired(entry)) continue;
-            if (this.isBlocked(host, entry.ip)) continue;
-            return { ip: entry.ip, port: entry.port, acquiredAt: entry.acquiredAt };
-        }
+        console.error(`${TAG} no IP available for ${host} (pool empty, all blocked or DPS limited)`);
         return null;
     }
 
-    async refillBufferPool(): Promise<void> {
+    /**
+     * 标记 host+IP 被封锁（10min 后自动解除）
+     * 不删除 IP 本身，只是让该 host 跳过这个 IP
+     */
+    markBlocked(host: string, ip: string): void {
+        const key = `${host}:${ip}`;
+        if (!this.blockedIps.has(key)) {
+            this.blockedIps.set(key, Date.now() + this.blockedIpTtlMs);
+            console.log(`${TAG} blocked ${host}+${ip} for ${this.blockedIpTtlMs / 1000}s`);
+        }
+    }
+
+    /**
+     * 反馈接口：web-archiver 报告封锁
+     * 只标记 blocked，不删除 IP（IP 可能对其他 host 仍可用）
+     */
+    invalidateHost(host: string, ip?: string): void {
+        if (ip) {
+            this.markBlocked(host, ip);
+        } else {
+            // 没有指定 IP，标记该 host 对所有当前 IP 都封锁（激进策略）
+            for (const entry of this.ipPool) {
+                this.markBlocked(host, entry.ip);
+            }
+            console.log(`${TAG} blocked all current IPs for ${host}`);
+        }
+    }
+
+    /**
+     * 从池中移除指定 IP（当 IP 确认不可用时调用）
+     * 同时标记该 IP 对所有 host 封锁，防止被重新分配
+     */
+    removeIp(ip: string, port: number): void {
+        const idx = this.ipPool.findIndex(p => p.ip === ip && p.port === port);
+        if (idx >= 0) {
+            this.ipPool.splice(idx, 1);
+            console.log(`${TAG} removed dead IP ${ip}:${port} from pool (remaining=${this.ipPool.length})`);
+        }
+    }
+
+    async refillPool(): Promise<void> {
         if (this.refillPromise) return this.refillPromise;
         this.refillPromise = this.doRefill();
         try {
@@ -136,127 +119,71 @@ export class SharedPool {
         }
     }
 
-    /**
-     * 封锁 host 的 IP。
-     * - DPS API 可用时：立即从 hostIps 删除，加入 blockedIps
-     * - DPS API 退避中：不删除 IP（保留当前 IP 继续使用），加入待处理队列
-     *   退避结束后自动处理
-     */
-    invalidateHost(host: string, ip?: string): void {
-        const entry = this.hostIps.get(host);
-        const effectiveIp = ip ?? entry?.ip;
-
-        if (this.canCallDps()) {
-            // DPS API 可用：立即删除，下次请求可获取新 IP
-            this.hostIps.delete(host);
-            if (effectiveIp) {
-                this.blockedIps.set(`${host}:${effectiveIp}`, Date.now() + this.blockedIpTtlMs);
-                console.log(`${TAG} invalidated ${host} IP=${effectiveIp}, blocked for ${this.blockedIpTtlMs / 1000}s`);
-            } else {
-                console.log(`${TAG} invalidated ${host} (no IP bound)`);
-            }
-        } else if (effectiveIp) {
-            // DPS API 退避中：暂不删除，加入待处理队列
-            this.pendingInvalidations.push({
-                host,
-                ip: effectiveIp,
-                reason: 'feedback',
-                queuedAt: Date.now(),
-            });
-            console.log(`${TAG} deferred invalidation for ${host} IP=${effectiveIp} (DPS backoff active, pending=${this.pendingInvalidations.length})`);
-        }
-    }
-
-    addBlocked(host: string, ip: string): void {
-        this.blockedIps.set(`${host}:${ip}`, Date.now() + this.blockedIpTtlMs);
-    }
-
     startIdleMonitor(): void {
         setInterval(() => {
+            this.removeExpiredIps();
+            // 清理过期的 blockedIps
             const now = Date.now();
-            for (const [host, entry] of this.hostIps) {
-                const idle = now - entry.lastRequestTime;
-                if (idle > this.ttlMs * 2) {
-                    if (!this.isExpired(entry)) {
-                        this.bufferPool.push({ ip: entry.ip, port: entry.port, acquiredAt: entry.acquiredAt });
-                    }
-                    this.hostIps.delete(host);
-                    console.log(`${TAG} idle host ${host} released (idle=${Math.round(idle / 1000)}s)`);
-                }
+            for (const [key, expiry] of this.blockedIps) {
+                if (now >= expiry) this.blockedIps.delete(key);
             }
         }, 60_000);
     }
 
     startHealthChecker(): void {
         setInterval(async () => {
-            const dpsAvailable = this.canCallDps();
-            for (const [host, entry] of this.hostIps) {
-                if (this.isExpired(entry)) {
-                    this.hostIps.delete(host);
+            const toRemove: CachedIp[] = [];
+            for (const ip of this.ipPool) {
+                if (this.isExpired(ip)) {
+                    toRemove.push(ip);
                     continue;
                 }
-                const alive = await this.checkHealth({ ip: entry.ip, port: entry.port }, host);
+                const alive = await this.checkHealth(ip);
                 if (!alive) {
-                    if (dpsAvailable) {
-                        // DPS 可用：立即删除，可获取新 IP
-                        console.log(`${TAG} periodic check failed for ${host}, discarding IP ${entry.ip}`);
-                        this.hostIps.delete(host);
-                    } else {
-                        // DPS 退避中：暂不删除，加入待处理队列
-                        this.pendingInvalidations.push({
-                            host,
-                            ip: entry.ip,
-                            reason: 'health_check',
-                            queuedAt: Date.now(),
-                        });
-                        console.log(`${TAG} periodic check failed for ${host} IP=${entry.ip}, deferred (DPS backoff active)`);
-                    }
+                    console.log(`${TAG} health check failed for ${ip.ip}:${ip.port}, removing`);
+                    toRemove.push(ip);
                 }
+            }
+            for (const ip of toRemove) {
+                this.removeFromPool(ip);
             }
         }, 5 * 60_000);
     }
 
-    /**
-     * 定期处理待删除队列（每 60s）
-     * 退避结束后，即使 bufferPool 不需要补充，也执行延迟的 invalidation
-     */
-    startPendingInvalidationProcessor(): void {
-        setInterval(() => {
-            this.processPendingInvalidations();
-        }, 60_000);
-    }
-
     // ---- internals ----
 
-    private async acquireNewForHost(host: string): Promise<CachedIp | null> {
-        let ip = this.popFromBufferPool(host);
-        if (ip) return ip;
-
-        await this.refillBufferPool();
-        ip = this.popFromBufferPool(host);
-        if (ip) return ip;
-
-        const fallback = this.getAnyAvailableIp(host);
-        if (fallback) {
-            console.log(`${TAG} ${host} reusing shared IP ${fallback.ip}:${fallback.port} (buffer empty, DPS rate limited)`);
-            return fallback;
+    private findAvailableIp(host: string): CachedIp | null {
+        for (const ip of this.ipPool) {
+            if (!this.isBlocked(host, ip.ip)) return ip;
         }
-
-        console.error(`${TAG} no IP available for ${host} (buffer empty, no shared IP, DPS rate limited)`);
         return null;
+    }
+
+    private findExpiredIp(host: string): CachedIp | null {
+        for (const ip of this.ipPool) {
+            if (this.isExpired(ip) && !this.isBlocked(host, ip.ip)) return ip;
+        }
+        return null;
+    }
+
+    private removeExpiredIps(): void {
+        const now = Date.now();
+        this.ipPool = this.ipPool.filter(ip => now - ip.acquiredAt < this.ttlMs);
+    }
+
+    private removeFromPool(ip: CachedIp): void {
+        const idx = this.ipPool.findIndex(p => p.ip === ip.ip && p.port === ip.port);
+        if (idx >= 0) this.ipPool.splice(idx, 1);
     }
 
     private canCallDps(): boolean {
         const now = Date.now();
         if (now < this.dpsBackoffUntil) return false;
-        // 诊断模式：取消 20s 节流，允许快速获取 IP
-        // if (now - this.lastDpsCallAt < 20_000) return false;
         const windowMs = 12 * 60 * 1000;
         this.ipExtractHistory = this.ipExtractHistory.filter(ts => now - ts < windowMs);
         return this.ipExtractHistory.length < 200;
     }
 
-    /** 判断 DPS API 不可用的原因（用于日志） */
     private getDpsBlockReason(): string {
         const now = Date.now();
         if (now < this.dpsBackoffUntil) return `backoff until ${new Date(this.dpsBackoffUntil).toISOString()}`;
@@ -266,67 +193,26 @@ export class SharedPool {
         return 'available';
     }
 
-    /**
-     * 处理待删除队列：退避结束后，执行之前延迟的 invalidation
-     */
-    private processPendingInvalidations(): void {
-        if (this.pendingInvalidations.length === 0) return;
-        if (!this.canCallDps()) return;
-
-        const now = Date.now();
-        const processed: number[] = [];
-
-        for (let i = 0; i < this.pendingInvalidations.length; i++) {
-            const pending = this.pendingInvalidations[i];
-            // 超过 5 分钟的待处理项过期丢弃（IP 可能已自然过期）
-            if (now - pending.queuedAt > 5 * 60_000) {
-                processed.push(i);
-                continue;
-            }
-
-            const entry = this.hostIps.get(pending.host);
-            // 只删除当前仍绑定同一 IP 的 host
-            if (entry && entry.ip === pending.ip) {
-                this.hostIps.delete(pending.host);
-                this.blockedIps.set(`${pending.host}:${pending.ip}`, now + this.blockedIpTtlMs);
-                console.log(`${TAG} processed deferred invalidation: ${pending.host} IP=${pending.ip} reason=${pending.reason}`);
-            }
-            processed.push(i);
-        }
-
-        // 从后往前删除，避免索引偏移
-        for (let i = processed.length - 1; i >= 0; i--) {
-            this.pendingInvalidations.splice(processed[i], 1);
-        }
-
-        if (processed.length > 0) {
-            console.log(`${TAG} processed ${processed.length} pending invalidations, ${this.pendingInvalidations.length} remaining`);
-        }
-    }
-
     private async doRefill(): Promise<void> {
-        // 退避结束后先处理待删除队列
-        this.processPendingInvalidations();
-
-        if (this.bufferPool.length >= this.bufferRefillThreshold) return;
+        if (this.ipPool.length >= this.refillThreshold) return;
         if (!this.canCallDps()) {
             console.warn(`${TAG} refill skipped: DPS API unavailable (${this.getDpsBlockReason()})`);
             return;
         }
-        const need = Math.min(this.bufferSize - this.bufferPool.length, 50);
+        const need = Math.min(this.poolSize - this.ipPool.length, 10);
         if (need <= 0) return;
         try {
             const ips = await this.dpsApi.getDpsIps(need);
             this.ipExtractHistory.push(Date.now());
             for (const ip of ips) {
-                this.bufferPool.push({ ip: ip.ip, port: ip.port, acquiredAt: Date.now() });
+                this.ipPool.push({ ip: ip.ip, port: ip.port, acquiredAt: Date.now() });
             }
-            console.log(`${TAG} buffer refilled with ${ips.length} IPs (total=${this.bufferPool.length}, extracted=${this.ipExtractHistory.length}/200)`);
+            console.log(`${TAG} pool refilled with ${ips.length} IPs (total=${this.ipPool.length}, extracted=${this.ipExtractHistory.length}/200)`);
         } catch (err: any) {
             console.error(`${TAG} refill failed: ${err.message}`);
             if (/超限|最多|rate/i.test(err.message)) {
                 this.dpsBackoffUntil = Date.now() + 300_000;
-                console.warn(`${TAG} DPS API rate limited, backing off for 300s until ${new Date(this.dpsBackoffUntil).toISOString()}`);
+                console.warn(`${TAG} DPS API rate limited, backing off for 300s`);
             }
         }
     }
@@ -346,8 +232,8 @@ export class SharedPool {
         return Date.now() - entry.acquiredAt >= this.ttlMs;
     }
 
-    private checkHealth(ipObj: { ip: string; port: number }, targetHost: string): Promise<boolean> {
-        const target = targetHost || 'www.baidu.com';
+    private checkHealth(ipObj: { ip: string; port: number }): Promise<boolean> {
+        const target = 'www.baidu.com';
         return new Promise<boolean>((resolve) => {
             const socket = net.connect({ host: ipObj.ip, port: ipObj.port });
             const cleanup = (ok: boolean) => { try { socket.destroy(); } catch {} resolve(ok); };
