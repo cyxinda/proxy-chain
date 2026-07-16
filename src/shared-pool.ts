@@ -31,7 +31,7 @@ export class SharedPool {
     private dpsBackoffUntil = 0;
     private ipExtractHistory: number[] = [];
 
-    constructor({ dpsApi, ttlMs, bufferSize = 5, bufferRefillThreshold = 2, blockedIpTtlMs = 600_000 }: {
+    constructor({ dpsApi, ttlMs, bufferSize = 10, bufferRefillThreshold = 3, blockedIpTtlMs = 600_000 }: {
         dpsApi: DpsApi;
         ttlMs: number;
         bufferSize?: number;
@@ -75,13 +75,19 @@ export class SharedPool {
     }
 
     popFromBufferPool(host: string): CachedIp | null {
+        const kept: CachedIp[] = [];
+        let result: CachedIp | null = null;
         while (this.bufferPool.length > 0) {
             const ip = this.bufferPool.shift()!;
             if (this.isExpired(ip)) continue;
-            if (this.isBlocked(host, ip.ip)) continue;
-            return ip;
+            if (!result && !this.isBlocked(host, ip.ip)) {
+                result = ip;
+            } else {
+                kept.push(ip);
+            }
         }
-        return null;
+        this.bufferPool.push(...kept);
+        return result;
     }
 
     getAnyAvailableIp(host: string): CachedIp | null {
@@ -186,7 +192,7 @@ export class SharedPool {
             console.warn(`${TAG} refill skipped: DPS API rate limited (extracted ${this.ipExtractHistory.length}/180 in 12min window)`);
             return;
         }
-        const need = Math.min(this.bufferSize - this.bufferPool.length, 5);
+        const need = Math.min(this.bufferSize - this.bufferPool.length, 10);
         if (need <= 0) return;
         this.lastDpsCallAt = Date.now();
         try {
