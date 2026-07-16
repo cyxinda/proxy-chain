@@ -15,6 +15,7 @@ forwarder:
   maxRetryAttempts: 5       # IP 轮换重试最大次数
   blockedIpTtlMs: 600000    # host+IP 封锁标记 TTL (10min，对齐网站解封周期)
   internalPort: 3129        # 内部 HTTP 端口 (接收 web-archiver 封锁反馈)
+  maxConcurrentAcquire: 3   # IP 获取并发限制 (防止缓冲池被瞬间耗尽)
 
 # DPS 短命池订单（Nacos 共享配置 application-dev.yml 中 dps-short 段）
 # dpsShort:

@@ -76,15 +76,31 @@ export class SharedPool {
 
     popFromBufferPool(host: string): CachedIp | null {
         const kept: CachedIp[] = [];
+        const expired: CachedIp[] = [];
         let result: CachedIp | null = null;
         while (this.bufferPool.length > 0) {
             const ip = this.bufferPool.shift()!;
-            if (this.isExpired(ip)) continue;
-            if (!result && !this.isBlocked(host, ip.ip)) {
+            if (this.isExpired(ip)) {
+                expired.push(ip);
+            } else if (!result && !this.isBlocked(host, ip.ip)) {
                 result = ip;
             } else {
                 kept.push(ip);
             }
+        }
+        // 如果没有可用的未过期 IP, 尝试过期 IP (复用一次)
+        if (!result && expired.length > 0) {
+            for (const ip of expired) {
+                if (!this.isBlocked(host, ip.ip)) {
+                    result = ip;
+                    console.log(`${TAG} reusing expired IP ${ip.ip}:${ip.port} for ${host} (age=${Math.round((Date.now() - ip.acquiredAt) / 1000)}s)`);
+                    break;
+                }
+                kept.push(ip);
+            }
+        }
+        if (!result) {
+            kept.push(...expired.filter(ip => !kept.includes(ip)));
         }
         this.bufferPool.push(...kept);
         return result;

@@ -35,6 +35,29 @@ const SESSION_TTL_MS = config.forwarder.sessionTtlMs;
 const VERBOSE = config.forwarder.verbose;
 const MAX_RETRY_ATTEMPTS = config.forwarder.maxRetryAttempts ?? 5;
 const INTERNAL_PORT = config.forwarder.internalPort ?? 3129;
+const MAX_CONCURRENT_ACQUIRE = config.forwarder.maxConcurrentAcquire ?? 3;
+
+// ── 并发限制 Semaphore ──
+
+class Semaphore {
+    private permits: number;
+    private queue: (() => void)[] = [];
+    constructor(permits: number) { this.permits = permits; }
+    async acquire(): Promise<void> {
+        if (this.permits > 0) { this.permits--; return; }
+        return new Promise<void>(r => this.queue.push(r));
+    }
+    release(): void {
+        if (this.queue.length > 0) {
+            const next = this.queue.shift()!;
+            next();
+        } else {
+            this.permits++;
+        }
+    }
+}
+
+const acquireSemaphore = new Semaphore(MAX_CONCURRENT_ACQUIRE);
 
 // ── 初始化双订单 DPS API ──
 
@@ -166,17 +189,23 @@ async function acquireSharedWithRetry(host: string): Promise<{ ip: string; port:
         return existing;
     }
 
-    // 慢速路径: 需要新 IP, 带健康检查的轮换重试
+    // 慢速路径: 并发限制 + 健康检查轮换重试
+    await acquireSemaphore.acquire();
+    try {
+        return await acquireSlowPath(host);
+    } finally {
+        acquireSemaphore.release();
+    }
+}
+
+async function acquireSlowPath(host: string): Promise<{ ip: string; port: number } | null> {
     for (let attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
         let ip = sharedPool.popFromBufferPool(host);
         if (!ip) {
             await sharedPool.refillBufferPool();
             ip = sharedPool.popFromBufferPool(host);
         }
-        if (!ip) {
-            console.warn(`${TAG} [shared] no IP available for ${host} (attempt ${attempt + 1})`);
-            break;
-        }
+        if (!ip) break;
 
         const healthy = await checkHealth({ ip: ip.ip, port: ip.port }, host);
         if (healthy) {
