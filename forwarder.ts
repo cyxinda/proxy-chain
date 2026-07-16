@@ -178,8 +178,10 @@ const statusServer = http.createServer((req, res) => {
     res.end();
 });
 
-statusServer.listen(PORT, () => {
-    console.log(`${TAG} status endpoint on :${PORT}/status`);
+const STATUS_PORT = PORT + 1;
+
+statusServer.listen(STATUS_PORT, () => {
+    console.log(`${TAG} status endpoint on :${STATUS_PORT}/status`);
 });
 
 // ── Start ──
