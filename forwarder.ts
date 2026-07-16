@@ -33,7 +33,7 @@ const PORT = config.forwarder.port;
 const SHARED_TTL_MS = config.forwarder.sharedTtlMs;
 const SESSION_TTL_MS = config.forwarder.sessionTtlMs;
 const VERBOSE = config.forwarder.verbose;
-const MAX_RETRY_ATTEMPTS = config.forwarder.maxRetryAttempts ?? 5;
+const MAX_RETRY_ATTEMPTS = config.forwarder.maxRetryAttempts ?? 30;
 const INTERNAL_PORT = config.forwarder.internalPort ?? 3129;
 const MAX_CONCURRENT_ACQUIRE = config.forwarder.maxConcurrentAcquire ?? 3;
 
@@ -290,6 +290,7 @@ console.log(`${TAG} config source: Nacos ${process.env.NACOS_SERVER_ADDR || '172
 
 sharedPool.startIdleMonitor();
 sharedPool.startHealthChecker();
+sharedPool.startPendingInvalidationProcessor();
 sessionPool.startIdleMonitor();
 sessionPool.startHealthChecker();
 
