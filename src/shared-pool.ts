@@ -27,6 +27,10 @@ export class SharedPool {
     private refillPromise: Promise<void> | null = null;
     private acquiring = new Map<string, Promise<CachedIp | null>>();
 
+    private lastDpsCallAt = 0;
+    private dpsBackoffUntil = 0;
+    private ipExtractHistory: number[] = [];
+
     constructor({ dpsApi, ttlMs, bufferSize = 5, bufferRefillThreshold = 2, blockedIpTtlMs = 600_000 }: {
         dpsApi: DpsApi;
         ttlMs: number;
@@ -76,6 +80,15 @@ export class SharedPool {
             if (this.isExpired(ip)) continue;
             if (this.isBlocked(host, ip.ip)) continue;
             return ip;
+        }
+        return null;
+    }
+
+    getAnyAvailableIp(host: string): CachedIp | null {
+        for (const [, entry] of this.hostIps) {
+            if (this.isExpired(entry)) continue;
+            if (this.isBlocked(host, entry.ip)) continue;
+            return { ip: entry.ip, port: entry.port, acquiredAt: entry.acquiredAt };
         }
         return null;
     }
@@ -142,29 +155,53 @@ export class SharedPool {
 
     private async acquireNewForHost(host: string): Promise<CachedIp | null> {
         let ip = this.popFromBufferPool(host);
-        if (!ip) {
-            await this.refillBufferPool();
-            ip = this.popFromBufferPool(host);
+        if (ip) return ip;
+
+        await this.refillBufferPool();
+        ip = this.popFromBufferPool(host);
+        if (ip) return ip;
+
+        const fallback = this.getAnyAvailableIp(host);
+        if (fallback) {
+            console.log(`${TAG} ${host} reusing shared IP ${fallback.ip}:${fallback.port} (buffer empty, DPS rate limited)`);
+            return fallback;
         }
-        if (!ip) {
-            console.error(`${TAG} no IP available for ${host} after refill`);
-            return null;
-        }
-        return ip;
+
+        console.error(`${TAG} no IP available for ${host} (buffer empty, no shared IP, DPS rate limited)`);
+        return null;
+    }
+
+    private canCallDps(): boolean {
+        const now = Date.now();
+        if (now < this.dpsBackoffUntil) return false;
+        if (now - this.lastDpsCallAt < 20_000) return false;
+        const windowMs = 12 * 60 * 1000;
+        this.ipExtractHistory = this.ipExtractHistory.filter(ts => now - ts < windowMs);
+        return this.ipExtractHistory.length < 180;
     }
 
     private async doRefill(): Promise<void> {
         if (this.bufferPool.length >= this.bufferRefillThreshold) return;
-        const need = this.bufferSize - this.bufferPool.length;
+        if (!this.canCallDps()) {
+            console.warn(`${TAG} refill skipped: DPS API rate limited (extracted ${this.ipExtractHistory.length}/180 in 12min window)`);
+            return;
+        }
+        const need = Math.min(this.bufferSize - this.bufferPool.length, 5);
         if (need <= 0) return;
+        this.lastDpsCallAt = Date.now();
         try {
             const ips = await this.dpsApi.getDpsIps(need);
+            this.ipExtractHistory.push(Date.now());
             for (const ip of ips) {
                 this.bufferPool.push({ ip: ip.ip, port: ip.port, acquiredAt: Date.now() });
             }
-            console.log(`${TAG} buffer refilled with ${ips.length} IPs (total=${this.bufferPool.length})`);
+            console.log(`${TAG} buffer refilled with ${ips.length} IPs (total=${this.bufferPool.length}, extracted=${this.ipExtractHistory.length}/180)`);
         } catch (err: any) {
             console.error(`${TAG} refill failed: ${err.message}`);
+            if (/超限|最多|rate/i.test(err.message)) {
+                this.dpsBackoffUntil = Date.now() + 300_000;
+                console.warn(`${TAG} DPS API rate limited, backing off for 300s`);
+            }
         }
     }
 
