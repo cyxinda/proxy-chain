@@ -121,7 +121,7 @@ COPY --from=prod-deps-layer /app/node_modules ./node_modules
 COPY --from=build-layer /app/dist/ dist/
 COPY --from=git-layer /data/config.yaml ./
 
-EXPOSE 3128
+EXPOSE 3128 3129
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD wget -qO- http://127.0.0.1:${FORWARDER_PORT}/healthz || exit 1

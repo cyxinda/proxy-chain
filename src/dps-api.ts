@@ -32,16 +32,21 @@ export class DpsApi {
     }
 
     async getDpsIp(): Promise<{ ip: string; port: number }> {
-        return this._getDpsIp(0);
+        const ips = await this.getDpsIps(1);
+        return ips[0];
     }
 
-    private async _getDpsIp(retry: number): Promise<{ ip: string; port: number }> {
+    async getDpsIps(num: number): Promise<{ ip: string; port: number }[]> {
+        return this._getDpsIps(num, 0);
+    }
+
+    private async _getDpsIps(num: number, retry: number): Promise<{ ip: string; port: number }[]> {
         const token = await this.ensureToken();
         const url = `${this.apiEndpoint}/getdps`;
         const params = new URLSearchParams({
             secret_id: this.secretId,
             signature: token,
-            num: '1',
+            num: String(Math.max(1, num)),
             format: 'text',
             sep: '1',
         });
@@ -74,19 +79,21 @@ export class DpsApi {
                 }
             }
 
-            // 纯文本错误（如 "ERROR(-107): secret_token expired: xxx"）
-            // 之前只检查 JSON 格式的 token 错误，纯文本的 token 过期没有重置 secretToken，
-            // 导致后续请求继续用过期 token，反复失败。检测到 token 过期后重置并重试一次。
             if (/ERROR.*token.*expired|secret_token.*expired|signature.*invalid/i.test(text)) {
                 if (retry >= 1) throw new Error(`getdps token still expired after refresh: ${truncate(text)}`);
                 console.warn(`${TAG}[${this.orderKey}] token expired, refreshing and retrying`);
                 this.secretToken = null;
-                return this._getDpsIp(retry + 1);
+                return this._getDpsIps(num, retry + 1);
             }
 
-            const m = /^([0-9.]+):(\d+)$/.exec(text.split(/\s+/)[0]);
-            if (!m) throw new Error(`getdps unexpected body: ${truncate(text)}`);
-            return { ip: m[1], port: parseInt(m[2], 10) };
+            const lines = text.split(/\n/).map(l => l.trim()).filter(Boolean);
+            const results: { ip: string; port: number }[] = [];
+            for (const line of lines) {
+                const m = /^([0-9.]+):(\d+)$/.exec(line.split(/\s+/)[0]);
+                if (m) results.push({ ip: m[1], port: parseInt(m[2], 10) });
+            }
+            if (results.length === 0) throw new Error(`getdps unexpected body: ${truncate(text)}`);
+            return results;
         } finally {
             clearTimeout(timer);
         }

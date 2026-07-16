@@ -9,116 +9,208 @@ interface CachedIp {
     acquiredAt: number;
 }
 
+interface HostEntry extends CachedIp {
+    lastRequestTime: number;
+}
+
 export class SharedPool {
     private dpsApi: DpsApi;
     private ttlMs: number;
-    private currentIP: CachedIp | null = null;
-    private lastRequestTime = 0;
+    private bufferSize: number;
+    private bufferRefillThreshold: number;
+    private blockedIpTtlMs: number;
 
-    // ProxyCat 策略: lock + cooldown
-    private switching = false;
-    private lastFailureTime = 0;
-    private readonly COOLDOWN_MS = 3_000;
+    private hostIps = new Map<string, HostEntry>();
+    private bufferPool: CachedIp[] = [];
+    private blockedIps = new Map<string, number>();
 
-    // 空闲监测
-    private isIdle = false;
+    private refillPromise: Promise<void> | null = null;
+    private acquiring = new Map<string, Promise<CachedIp | null>>();
 
-    // 并发安全: 防止重复调用 DPS API
-    private fetchPromise: Promise<CachedIp | null> | null = null;
-
-    constructor({ dpsApi, ttlMs }: { dpsApi: DpsApi; ttlMs: number }) {
+    constructor({ dpsApi, ttlMs, bufferSize = 5, bufferRefillThreshold = 2, blockedIpTtlMs = 600_000 }: {
+        dpsApi: DpsApi;
+        ttlMs: number;
+        bufferSize?: number;
+        bufferRefillThreshold?: number;
+        blockedIpTtlMs?: number;
+    }) {
         this.dpsApi = dpsApi;
         this.ttlMs = ttlMs;
+        this.bufferSize = bufferSize;
+        this.bufferRefillThreshold = bufferRefillThreshold;
+        this.blockedIpTtlMs = blockedIpTtlMs;
     }
 
-    async acquire(): Promise<CachedIp | null> {
-        if (this.isIdle) this.wake();
-
-        if (this.currentIP && Date.now() - this.currentIP.acquiredAt < this.ttlMs) {
-            return this.currentIP;
+    async acquireForHost(host: string): Promise<CachedIp | null> {
+        const entry = this.hostIps.get(host);
+        if (entry && !this.isExpired(entry)) {
+            entry.lastRequestTime = Date.now();
+            return entry;
         }
 
-        // 并发安全: 已有 fetch 在进行中, 复用结果
-        if (this.fetchPromise) return this.fetchPromise;
+        if (this.acquiring.has(host)) {
+            return this.acquiring.get(host)!;
+        }
 
-        this.fetchPromise = this.fetchNew();
+        const promise = this.acquireNewForHost(host);
+        this.acquiring.set(host, promise);
         try {
-            return await this.fetchPromise;
+            return await promise;
         } finally {
-            this.fetchPromise = null;
+            this.acquiring.delete(host);
         }
     }
 
-    touchLastRequest(): void {
-        this.lastRequestTime = Date.now();
+    touchLastRequest(host: string): void {
+        const entry = this.hostIps.get(host);
+        if (entry) entry.lastRequestTime = Date.now();
     }
 
-    /**
-     * ProxyCat 策略: lock + cooldown + verify-before-switch
-     * CONNECT 失败时调用
-     */
-    async invalidateWithCooldown(): Promise<void> {
-        if (this.switching) return;
-        if (Date.now() - this.lastFailureTime < this.COOLDOWN_MS) return;
+    bindHostIp(host: string, ip: CachedIp): void {
+        this.hostIps.set(host, { ...ip, lastRequestTime: Date.now() });
+    }
 
-        this.switching = true;
-        this.lastFailureTime = Date.now();
+    popFromBufferPool(host: string): CachedIp | null {
+        while (this.bufferPool.length > 0) {
+            const ip = this.bufferPool.shift()!;
+            if (this.isExpired(ip)) continue;
+            if (this.isBlocked(host, ip.ip)) continue;
+            return ip;
+        }
+        return null;
+    }
+
+    async refillBufferPool(): Promise<void> {
+        if (this.refillPromise) return this.refillPromise;
+        this.refillPromise = this.doRefill();
         try {
-            if (this.currentIP && await this.isCurrentIpStillValid()) {
-                console.log(`${TAG} IP still valid after failure, keeping ${this.currentIP.ip}:${this.currentIP.port}`);
-                return;
-            }
-            console.log(`${TAG} discarding dead IP ${this.currentIP?.ip}:${this.currentIP?.port}`);
-            this.currentIP = null;
+            await this.refillPromise;
         } finally {
-            this.switching = false;
+            this.refillPromise = null;
         }
+    }
+
+    invalidateHost(host: string, ip?: string): void {
+        const entry = this.hostIps.get(host);
+        const effectiveIp = ip ?? entry?.ip;
+        this.hostIps.delete(host);
+        if (effectiveIp) {
+            this.blockedIps.set(`${host}:${effectiveIp}`, Date.now() + this.blockedIpTtlMs);
+            console.log(`${TAG} invalidated ${host} IP=${effectiveIp}, blocked for ${this.blockedIpTtlMs / 1000}s`);
+        } else {
+            console.log(`${TAG} invalidated ${host} (no IP bound)`);
+        }
+    }
+
+    addBlocked(host: string, ip: string): void {
+        this.blockedIps.set(`${host}:${ip}`, Date.now() + this.blockedIpTtlMs);
     }
 
     startIdleMonitor(): void {
         setInterval(() => {
-            if (!this.isIdle && this.lastRequestTime > 0 && Date.now() - this.lastRequestTime > this.ttlMs * 2) {
-                console.log(`${TAG} idle for >${this.ttlMs * 2}ms, pausing refresh`);
-                this.isIdle = true;
-                this.currentIP = null;
+            const now = Date.now();
+            for (const [host, entry] of this.hostIps) {
+                const idle = now - entry.lastRequestTime;
+                if (idle > this.ttlMs * 2) {
+                    if (!this.isExpired(entry)) {
+                        this.bufferPool.push({ ip: entry.ip, port: entry.port, acquiredAt: entry.acquiredAt });
+                    }
+                    this.hostIps.delete(host);
+                    console.log(`${TAG} idle host ${host} released (idle=${Math.round(idle / 1000)}s)`);
+                }
             }
         }, 60_000);
     }
 
+    startHealthChecker(): void {
+        setInterval(async () => {
+            for (const [host, entry] of this.hostIps) {
+                if (this.isExpired(entry)) {
+                    this.hostIps.delete(host);
+                    continue;
+                }
+                const alive = await this.checkHealth({ ip: entry.ip, port: entry.port }, host);
+                if (!alive) {
+                    console.log(`${TAG} periodic check failed for ${host}, discarding IP ${entry.ip}`);
+                    this.hostIps.delete(host);
+                }
+            }
+        }, 5 * 60_000);
+    }
+
     // ---- internals ----
 
-    private async fetchNew(retries = 1): Promise<CachedIp | null> {
-        for (let attempt = 0; attempt <= retries; attempt++) {
-            try {
-                const ip = await this.dpsApi.getDpsIp();
-                this.currentIP = { ...ip, acquiredAt: Date.now() };
-                console.log(`${TAG} acquired new IP ${ip.ip}:${ip.port}`);
-                return this.currentIP;
-            } catch (err: any) {
-                console.warn(`${TAG} fetch attempt ${attempt + 1}/${retries + 1} failed: ${err.message}`);
-                if (attempt < retries) await sleep(300);
-            }
+    private async acquireNewForHost(host: string): Promise<CachedIp | null> {
+        let ip = this.popFromBufferPool(host);
+        if (!ip) {
+            await this.refillBufferPool();
+            ip = this.popFromBufferPool(host);
         }
-        console.error(`${TAG} all fetch attempts failed`);
-        return null;
+        if (!ip) {
+            console.error(`${TAG} no IP available for ${host} after refill`);
+            return null;
+        }
+        return ip;
     }
 
-    private async isCurrentIpStillValid(): Promise<boolean> {
-        if (!this.currentIP) return false;
+    private async doRefill(): Promise<void> {
+        if (this.bufferPool.length >= this.bufferRefillThreshold) return;
+        const need = this.bufferSize - this.bufferPool.length;
+        if (need <= 0) return;
+        try {
+            const ips = await this.dpsApi.getDpsIps(need);
+            for (const ip of ips) {
+                this.bufferPool.push({ ip: ip.ip, port: ip.port, acquiredAt: Date.now() });
+            }
+            console.log(`${TAG} buffer refilled with ${ips.length} IPs (total=${this.bufferPool.length})`);
+        } catch (err: any) {
+            console.error(`${TAG} refill failed: ${err.message}`);
+        }
+    }
+
+    private isBlocked(host: string, ip: string): boolean {
+        const key = `${host}:${ip}`;
+        const expiry = this.blockedIps.get(key);
+        if (!expiry) return false;
+        if (Date.now() >= expiry) {
+            this.blockedIps.delete(key);
+            return false;
+        }
+        return true;
+    }
+
+    private isExpired(entry: { acquiredAt: number }): boolean {
+        return Date.now() - entry.acquiredAt >= this.ttlMs;
+    }
+
+    private checkHealth(ipObj: { ip: string; port: number }, targetHost: string): Promise<boolean> {
+        const target = targetHost || 'www.baidu.com';
         return new Promise<boolean>((resolve) => {
-            const socket = net.connect({ host: this.currentIP!.ip, port: this.currentIP!.port });
+            const socket = net.connect({ host: ipObj.ip, port: ipObj.port });
             const cleanup = (ok: boolean) => { try { socket.destroy(); } catch {} resolve(ok); };
-            const timer = setTimeout(() => cleanup(false), 3_000);
+            const timer = setTimeout(() => cleanup(false), 4_000);
             socket.on('error', () => { clearTimeout(timer); cleanup(false); });
-            socket.once('connect', () => { clearTimeout(timer); cleanup(true); });
+            socket.on('close', () => clearTimeout(timer));
+            socket.once('connect', () => {
+                const auth = Buffer.from(
+                    `${this.dpsApi.proxyUsername}:${this.dpsApi.proxyPassword || ''}`
+                ).toString('base64');
+                socket.write(
+                    `CONNECT ${target}:443 HTTP/1.1\r\n` +
+                    `Host: ${target}:443\r\n` +
+                    `Proxy-Authorization: Basic ${auth}\r\n\r\n`
+                );
+            });
+            let buf = '';
+            socket.on('data', (chunk: Buffer) => {
+                buf += chunk.toString();
+                const firstLine = buf.split('\r\n')[0];
+                if (/^HTTP\/1\.[01] 2\d\d /.test(firstLine)) {
+                    clearTimeout(timer); cleanup(true);
+                } else if (/^HTTP\/1\.[01] [3-5]\d\d /.test(firstLine)) {
+                    clearTimeout(timer); cleanup(false);
+                }
+            });
         });
     }
-
-    private wake(): void {
-        this.isIdle = false;
-    }
-}
-
-function sleep(ms: number): Promise<void> {
-    return new Promise((r) => setTimeout(r, ms));
 }

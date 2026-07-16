@@ -154,6 +154,11 @@ export const config = {
     sharedTtlMs: num(process.env.SHARED_TTL_MS, file.forwarder?.sharedTtlMs, 90_000),
     sessionTtlMs: num(process.env.SESSION_TTL_MS, file.forwarder?.sessionTtlMs, 900_000),
     sessionFailureThreshold: num(process.env.SESSION_FAILURE_THRESHOLD, file.forwarder?.sessionFailureThreshold, 2),
+    bufferSize: num(process.env.BUFFER_SIZE, file.forwarder?.bufferSize, 5),
+    bufferRefillThreshold: num(process.env.BUFFER_REFILL_THRESHOLD, file.forwarder?.bufferRefillThreshold, 2),
+    maxRetryAttempts: num(process.env.MAX_RETRY_ATTEMPTS, file.forwarder?.maxRetryAttempts, 5),
+    blockedIpTtlMs: num(process.env.BLOCKED_IP_TTL_MS, file.forwarder?.blockedIpTtlMs, 600_000),
+    internalPort: num(process.env.INTERNAL_PORT, file.forwarder?.internalPort, 3129),
   },
 };
 

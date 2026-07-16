@@ -9,7 +9,12 @@ forwarder:
   verbose: false
   sharedTtlMs: 90000      # 短命池 TTL 1.5min
   sessionTtlMs: 900000    # 长命池 TTL 15min
-  sessionFailureThreshold: 2  # 长命池账期失败阈值，>=此值触发健康检查
+  sessionFailureThreshold: 2  # 长命池账期失败阈值，>=此值直接删除 IP
+  bufferSize: 5             # 短命池本地缓冲池大小
+  bufferRefillThreshold: 2  # 缓冲池低于此值时触发批量获取
+  maxRetryAttempts: 5       # IP 轮换重试最大次数
+  blockedIpTtlMs: 600000    # host+IP 封锁标记 TTL (10min，对齐网站解封周期)
+  internalPort: 3129        # 内部 HTTP 端口 (接收 web-archiver 封锁反馈)
 
 # DPS 短命池订单（Nacos 共享配置 application-dev.yml 中 dps-short 段）
 # dpsShort:

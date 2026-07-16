@@ -62,10 +62,6 @@ export class SessionPool {
         if (entry) entry.lastRequestTime = Date.now();
     }
 
-    /**
-     * 记录请求失败 (账期计数)
-     * 达到阈值后触发健康检查, 不通过则丢弃 IP
-     */
     async recordFailure(sessionId: string): Promise<void> {
         const entry = this.sessions.get(sessionId);
         if (!entry) return;
@@ -74,14 +70,8 @@ export class SessionPool {
         console.log(`${TAG} ${sessionId} failure ${entry.billingPeriod.failureCount}/${entry.billingPeriod.failureThreshold}`);
 
         if (entry.billingPeriod.failureCount >= entry.billingPeriod.failureThreshold) {
-            const alive = await this.checkEntryHealth(entry);
-            if (!alive) {
-                console.log(`${TAG} ${sessionId} health check failed, discarding IP ${entry.ip}:${entry.port}`);
-                this.sessions.delete(sessionId);
-            } else {
-                console.log(`${TAG} ${sessionId} health check passed, resetting failure count`);
-                entry.billingPeriod.failureCount = 0;
-            }
+            console.log(`${TAG} ${sessionId} failure threshold reached, discarding IP ${entry.ip}:${entry.port} directly`);
+            this.sessions.delete(sessionId);
         }
     }
 
