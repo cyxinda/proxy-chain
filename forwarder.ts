@@ -167,14 +167,19 @@ server.on('connectionClosed', ({ connectionId, stats }: { connectionId: number; 
 // ── Proactive IP refresh ──
 // Without this, when web-archiver stops requesting (e.g. all IPs expired),
 // getSharedIp() is never called -> IP never refreshes -> deadlock.
-// Refresh at TTL * 0.8 to get a new IP before the current one expires.
+// web-archiver skips when age >= ipMaxAgeMs (60s), but SHARED_TTL_MS is 90s,
+// so we must force-refresh before web-archiver's threshold to avoid the skip.
 
-const REFRESH_INTERVAL_MS = Math.max(Math.floor(SHARED_TTL_MS * 0.8), 30_000);
+const IP_MAX_AGE_MS = config.polling?.ipMaxAgeMs || 60_000;
+const REFRESH_INTERVAL_MS = Math.max(Math.floor(IP_MAX_AGE_MS * 0.8), 30_000);
 const ipRefreshTimer = setInterval(async () => {
     const age = currentIp ? Date.now() - currentIp.acquiredAt : Infinity;
     if (age >= REFRESH_INTERVAL_MS) {
         try {
+            // Force invalidate so getSharedIp() fetches a new IP
+            // (getSharedIp() returns old IP if age < SHARED_TTL_MS=90s)
             console.log(`${TAG} [shared] proactive refresh (age=${Math.round(age / 1000)}s >= ${Math.round(REFRESH_INTERVAL_MS / 1000)}s)`);
+            currentIp = null;
             const ip = await getSharedIp();
             console.log(`${TAG} [shared] refreshed IP ${ip.ip}:${ip.port}`);
         } catch (err: any) {
