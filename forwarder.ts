@@ -9,6 +9,7 @@
  */
 
 import os from 'node:os';
+import net from 'node:net';
 import http from 'node:http';
 import { Server } from './src/server.js';
 import { DpsApi } from './src/dps-api.js';
@@ -55,6 +56,36 @@ const LONG_PROXY_PASS = config.dpsLong.proxyPassword;
 let currentIp: { ip: string; port: number; acquiredAt: number } | null = null;
 let ipPromise: Promise<{ ip: string; port: number }> | null = null;
 
+/** 健康检查: 通过 DPS 代理 CONNECT 测试目标站点（复用 session-pool 逻辑） */
+function checkIpHealth(ipObj: { ip: string; port: number }, targetHost: string): Promise<boolean> {
+    const target = targetHost || 'www.baidu.com';
+    return new Promise<boolean>((resolve) => {
+        const socket = net.connect({ host: ipObj.ip, port: ipObj.port });
+        const cleanup = (ok: boolean) => { try { socket.destroy(); } catch {} resolve(ok); };
+        const timer = setTimeout(() => cleanup(false), 4_000);
+        socket.on('error', () => { clearTimeout(timer); cleanup(false); });
+        socket.on('close', () => clearTimeout(timer));
+        socket.once('connect', () => {
+            const auth = Buffer.from(`${SHORT_PROXY_USER}:${SHORT_PROXY_PASS}`).toString('base64');
+            socket.write(
+                `CONNECT ${target}:443 HTTP/1.1\r\n` +
+                `Host: ${target}:443\r\n` +
+                `Proxy-Authorization: Basic ${auth}\r\n\r\n`
+            );
+        });
+        let buf = '';
+        socket.on('data', (chunk: Buffer) => {
+            buf += chunk.toString();
+            const firstLine = buf.split('\r\n')[0];
+            if (/^HTTP\/1\.[01] 2\d\d /.test(firstLine)) {
+                clearTimeout(timer); cleanup(true);
+            } else if (/^HTTP\/1\.[01] [3-5]\d\d /.test(firstLine)) {
+                clearTimeout(timer); cleanup(false);
+            }
+        });
+    });
+}
+
 async function getSharedIp(): Promise<{ ip: string; port: number }> {
     // Return existing IP if valid
     if (currentIp && Date.now() - currentIp.acquiredAt < SHARED_TTL_MS) {
@@ -65,12 +96,20 @@ async function getSharedIp(): Promise<{ ip: string; port: number }> {
     if (ipPromise) return ipPromise;
 
     ipPromise = (async () => {
-        // Get new IP from DPS API
-        const ips = await dpsApiShort.getDpsIps(1);
-        if (!ips || ips.length === 0) throw new Error('DPS API: no IP returned');
-        currentIp = { ip: ips[0].ip, port: ips[0].port, acquiredAt: Date.now() };
-        console.log(`${TAG} [shared] new IP ${currentIp.ip}:${currentIp.port}`);
-        return currentIp;
+        // 最多尝试 5 次获取健康 IP（DPS IP 池质量参差，死 IP 跳过）
+        for (let i = 0; i < 5; i++) {
+            const ips = await dpsApiShort.getDpsIps(1);
+            if (!ips || ips.length === 0) throw new Error('DPS API: no IP returned');
+            const candidate = { ip: ips[0].ip, port: ips[0].port };
+            const healthy = await checkIpHealth(candidate, 'www.baidu.com');
+            if (healthy) {
+                currentIp = { ...candidate, acquiredAt: Date.now() };
+                console.log(`${TAG} [shared] new IP ${currentIp.ip}:${currentIp.port} (healthy after ${i + 1} attempt(s))`);
+                return currentIp;
+            }
+            console.warn(`${TAG} [shared] IP ${candidate.ip}:${candidate.port} health check failed (attempt ${i + 1}/5), skipping dead IP`);
+        }
+        throw new Error('DPS: failed to get healthy IP after 5 attempts');
     })();
 
     try {
