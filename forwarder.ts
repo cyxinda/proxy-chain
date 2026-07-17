@@ -220,14 +220,16 @@ server.on('connectionClosed', ({ connectionId, stats }: { connectionId: number; 
 });
 
 // ── Proactive IP refresh (active mode only) ──
-// In active mode (recent requests), proactively rotate IP before web-archiver's
-// skip threshold. In idle mode (no requests for 5min), stop rotating to save
-// DPS quota. web-archiver will send requests even when IP is null/expired,
-// which triggers prepareRequestFunction -> getSharedIp() on demand.
-// (No standby IP kept -- avoids wasting IP quota when idle.)
+// Refresh based on DPS IP's actual TTL (SHARED_TTL_MS), not web-archiver's
+// skip threshold. web-archiver no longer skips on expired IP (v2.1.5+),
+// so we only need to rotate before DPS expires. Leave 10s safety margin
+// to avoid using an IP that expires mid-request.
+//
+// In idle mode (no requests for 5min), stop rotating to save DPS quota.
+// web-archiver will send requests even when IP is null/expired, which
+// triggers prepareRequestFunction -> getSharedIp() on demand.
 
-const IP_MAX_AGE_MS = config.polling?.ipMaxAgeMs || 60_000;
-const REFRESH_INTERVAL_MS = Math.max(Math.floor(IP_MAX_AGE_MS * 0.8), 30_000);
+const REFRESH_INTERVAL_MS = Math.max(SHARED_TTL_MS - 10_000, 30_000); // DPS TTL - 10s safety margin
 const IDLE_STOP_MS = 5 * 60_000;
 let lastRequestAt = Date.now();
 
