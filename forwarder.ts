@@ -115,6 +115,7 @@ const server = new Server({
     healthCheckPath: '/healthz',
     prepareRequestFunction: async ({ username, hostname, port, isHttp }) => {
         try {
+            lastRequestAt = Date.now();
             const target = `${hostname}:${port}`;
 
             if (!username) {
@@ -164,21 +165,37 @@ server.on('connectionClosed', ({ connectionId, stats }: { connectionId: number; 
     }
 });
 
-// ── Proactive IP refresh ──
+// ── Proactive IP refresh (demand-driven) ──
 // Without this, when web-archiver stops requesting (e.g. all IPs expired),
 // getSharedIp() is never called -> IP never refreshes -> deadlock.
-// web-archiver skips when age >= ipMaxAgeMs (60s), but SHARED_TTL_MS is 90s,
-// so we must force-refresh before web-archiver's threshold to avoid the skip.
+//
+// But unconditional refresh wastes DPS IP quota when idle (no crawl requests).
+// Solution: only refresh while there is recent activity. Track lastRequestAt;
+// if no request for IDLE_STOP_MS, stop refreshing (web-archiver will
+// trigger getSharedIp() on its next request anyway since currentIp will be null).
+//
+// web-archiver skips when age >= ipMaxAgeMs (60s), so we refresh at 0.8x to stay ahead.
 
 const IP_MAX_AGE_MS = config.polling?.ipMaxAgeMs || 60_000;
 const REFRESH_INTERVAL_MS = Math.max(Math.floor(IP_MAX_AGE_MS * 0.8), 30_000);
+const IDLE_STOP_MS = 5 * 60_000; // no request for 5min -> stop proactive refresh
+let lastRequestAt = Date.now();
+
 const ipRefreshTimer = setInterval(async () => {
+    const idleMs = Date.now() - lastRequestAt;
+    if (idleMs >= IDLE_STOP_MS) {
+        // Idle: no proactive refresh. If currentIp is also expired, clear it
+        // so the next request triggers a fresh getSharedIp() on demand.
+        if (currentIp && Date.now() - currentIp.acquiredAt >= SHARED_TTL_MS) {
+            console.log(`${TAG} [shared] idle ${Math.round(idleMs / 1000)}s, clearing expired IP`);
+            currentIp = null;
+        }
+        return;
+    }
     const age = currentIp ? Date.now() - currentIp.acquiredAt : Infinity;
     if (age >= REFRESH_INTERVAL_MS) {
         try {
-            // Force invalidate so getSharedIp() fetches a new IP
-            // (getSharedIp() returns old IP if age < SHARED_TTL_MS=90s)
-            console.log(`${TAG} [shared] proactive refresh (age=${Math.round(age / 1000)}s >= ${Math.round(REFRESH_INTERVAL_MS / 1000)}s)`);
+            console.log(`${TAG} [shared] proactive refresh (age=${Math.round(age / 1000)}s >= ${Math.round(REFRESH_INTERVAL_MS / 1000)}s, idle=${Math.round(idleMs / 1000)}s)`);
             currentIp = null;
             const ip = await getSharedIp();
             console.log(`${TAG} [shared] refreshed IP ${ip.ip}:${ip.port}`);
