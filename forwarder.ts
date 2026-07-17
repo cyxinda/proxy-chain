@@ -182,21 +182,29 @@ const server = new Server({
     },
 });
 
-// ── tunnelConnectFailed: invalidate dead IP (with failure threshold) ──
+// ── tunnelConnectFailed: invalidate dead IP (with failure threshold + ratio) ──
+// Single-site CONNECT failure should NOT invalidate the shared IP -- it may
+// just be that one target site blocks this IP. Only invalidate when failures
+// are frequent across multiple requests (indicating the IP itself is dead).
+// Track failures with a sliding window: count failures, reset on success,
+// invalidate when count reaches threshold.
 
 let sharedIpFailures = 0;
-const SHARED_IP_FAILURE_THRESHOLD = 3;
+let sharedIpSuccesses = 0;
+const SHARED_IP_FAILURE_THRESHOLD = 5; // 5 consecutive failures (no success in between) -> invalidate
 
 server.on('tunnelConnectFailed', async ({ customTag }: { customTag?: { mode: string; id?: string } }) => {
     try {
         if (customTag?.mode === 'shared') {
+            if (!currentIp) return; // already invalidated, nothing to do
             sharedIpFailures++;
             if (sharedIpFailures >= SHARED_IP_FAILURE_THRESHOLD) {
-                console.log(`${TAG} [shared] invalidated IP ${currentIp?.ip}:${currentIp?.port} (${sharedIpFailures} consecutive failures)`);
+                console.log(`${TAG} [shared] invalidated IP ${currentIp.ip}:${currentIp.port} (${sharedIpFailures} consecutive failures, ${sharedIpSuccesses} successes)`);
                 invalidateSharedIp();
                 sharedIpFailures = 0;
+                sharedIpSuccesses = 0;
             } else {
-                console.warn(`${TAG} [shared] CONNECT failed (${sharedIpFailures}/${SHARED_IP_FAILURE_THRESHOLD}), keeping IP ${currentIp?.ip}:${currentIp?.port}`);
+                console.warn(`${TAG} [shared] CONNECT failed (${sharedIpFailures}/${SHARED_IP_FAILURE_THRESHOLD}, ${sharedIpSuccesses} ok), keeping IP ${currentIp?.ip}:${currentIp?.port}`);
             }
         } else if (customTag?.mode === 'session' && customTag.id) {
             await sessionPool.recordFailure(customTag.id);
@@ -208,7 +216,8 @@ server.on('tunnelConnectFailed', async ({ customTag }: { customTag?: { mode: str
 
 // 成功时重置失败计数
 server.on('tunnelConnectResponded', () => {
-    if (sharedIpFailures > 0) sharedIpFailures = 0;
+    sharedIpFailures = 0;
+    sharedIpSuccesses++;
 });
 
 // ── Connection stats ──
