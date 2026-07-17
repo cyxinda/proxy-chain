@@ -182,18 +182,33 @@ const server = new Server({
     },
 });
 
-// ── tunnelConnectFailed: invalidate dead IP ──
+// ── tunnelConnectFailed: invalidate dead IP (with failure threshold) ──
+
+let sharedIpFailures = 0;
+const SHARED_IP_FAILURE_THRESHOLD = 3;
 
 server.on('tunnelConnectFailed', async ({ customTag }: { customTag?: { mode: string; id?: string } }) => {
     try {
         if (customTag?.mode === 'shared') {
-            invalidateSharedIp();
+            sharedIpFailures++;
+            if (sharedIpFailures >= SHARED_IP_FAILURE_THRESHOLD) {
+                console.log(`${TAG} [shared] invalidated IP ${currentIp?.ip}:${currentIp?.port} (${sharedIpFailures} consecutive failures)`);
+                invalidateSharedIp();
+                sharedIpFailures = 0;
+            } else {
+                console.warn(`${TAG} [shared] CONNECT failed (${sharedIpFailures}/${SHARED_IP_FAILURE_THRESHOLD}), keeping IP ${currentIp?.ip}:${currentIp?.port}`);
+            }
         } else if (customTag?.mode === 'session' && customTag.id) {
             await sessionPool.recordFailure(customTag.id);
         }
     } catch (err: any) {
         console.error(`${TAG} tunnelConnectFailed handler error: ${err.message}`);
     }
+});
+
+// 成功时重置失败计数
+server.on('tunnelConnectResponded', () => {
+    if (sharedIpFailures > 0) sharedIpFailures = 0;
 });
 
 // ── Connection stats ──
