@@ -159,8 +159,29 @@ server.on('tunnelConnectFailed', async ({ customTag }: { customTag?: { mode: str
 // ── Connection stats ──
 
 server.on('connectionClosed', ({ connectionId, stats }: { connectionId: number; stats: any }) => {
-    console.log(`${TAG} [${connectionId}] srcTx=${stats.srcTxBytes} srcRx=${stats.srcRxBytes} trgTx=${stats.trgTxBytes} trgRx=${stats.trgRxBytes}`);
+    if (VERBOSE) {
+        console.log(`${TAG} [${connectionId}] srcTx=${stats.srcTxBytes} srcRx=${stats.srcRxBytes} trgTx=${stats.trgTxBytes} trgRx=${stats.trgRxBytes}`);
+    }
 });
+
+// ── Proactive IP refresh ──
+// Without this, when web-archiver stops requesting (e.g. all IPs expired),
+// getSharedIp() is never called -> IP never refreshes -> deadlock.
+// Refresh at TTL * 0.8 to get a new IP before the current one expires.
+
+const REFRESH_INTERVAL_MS = Math.max(Math.floor(SHARED_TTL_MS * 0.8), 30_000);
+const ipRefreshTimer = setInterval(async () => {
+    const age = currentIp ? Date.now() - currentIp.acquiredAt : Infinity;
+    if (age >= REFRESH_INTERVAL_MS) {
+        try {
+            console.log(`${TAG} [shared] proactive refresh (age=${Math.round(age / 1000)}s >= ${Math.round(REFRESH_INTERVAL_MS / 1000)}s)`);
+            const ip = await getSharedIp();
+            console.log(`${TAG} [shared] refreshed IP ${ip.ip}:${ip.port}`);
+        } catch (err: any) {
+            console.error(`${TAG} [shared] proactive refresh failed: ${err.message}`);
+        }
+    }
+}, Math.max(Math.floor(REFRESH_INTERVAL_MS / 2), 15_000));
 
 // ── Status endpoint for web-archiver ──
 
@@ -198,6 +219,7 @@ registerService(nacosConfig.serviceName, localIp, PORT).catch(() => {});
 
 const shutdown = async () => {
     console.log(`${TAG} shutting down...`);
+    clearInterval(ipRefreshTimer);
     statusServer.close();
     await deregisterService(nacosConfig.serviceName, localIp, PORT).catch(() => {});
     await server.close(true);
