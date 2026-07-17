@@ -219,34 +219,44 @@ server.on('connectionClosed', ({ connectionId, stats }: { connectionId: number; 
     }
 });
 
-// ── Proactive IP refresh (demand-driven) ──
-// Without this, when web-archiver stops requesting (e.g. all IPs expired),
-// getSharedIp() is never called -> IP never refreshes -> deadlock.
+// ── Proactive IP refresh (demand-driven with standby) ──
+// web-archiver's polling loop checks /status and SKIPS when IP is null or expired.
+// It does NOT send requests when IP is unavailable, so it cannot trigger
+// getSharedIp() via prepareRequestFunction. This means:
 //
-// But unconditional refresh wastes DPS IP quota when idle (no crawl requests).
-// Solution: only refresh while there is recent activity. Track lastRequestAt;
-// if no request for IDLE_STOP_MS, stop refreshing (web-archiver will
-// trigger getSharedIp() on its next request anyway since currentIp will be null).
+//   idle 5min -> timer stops -> currentIp cleared -> web-archiver sees null -> skip
+//   -> no request -> getSharedIp() never called -> DEADLOCK
 //
-// web-archiver skips when age >= ipMaxAgeMs (60s), so we refresh at 0.8x to stay ahead.
+// Solution: never fully stop the timer. In idle mode, we don't proactively
+// rotate IPs (saves quota), but we DO keep at least one valid IP available
+// so web-archiver can immediately resume when tasks arrive.
 
 const IP_MAX_AGE_MS = config.polling?.ipMaxAgeMs || 60_000;
 const REFRESH_INTERVAL_MS = Math.max(Math.floor(IP_MAX_AGE_MS * 0.8), 30_000);
-const IDLE_STOP_MS = 5 * 60_000; // no request for 5min -> stop proactive refresh
+const IDLE_STOP_MS = 5 * 60_000; // no request for 5min -> idle mode (stop rotation, keep standby)
 let lastRequestAt = Date.now();
 
 const ipRefreshTimer = setInterval(async () => {
     const idleMs = Date.now() - lastRequestAt;
+    const age = currentIp ? Date.now() - currentIp.acquiredAt : Infinity;
+
     if (idleMs >= IDLE_STOP_MS) {
-        // Idle: no proactive refresh. If currentIp is also expired, clear it
-        // so the next request triggers a fresh getSharedIp() on demand.
-        if (currentIp && Date.now() - currentIp.acquiredAt >= SHARED_TTL_MS) {
-            console.log(`${TAG} [shared] idle ${Math.round(idleMs / 1000)}s, clearing expired IP`);
-            currentIp = null;
+        // Idle mode: don't rotate IPs, but ensure at least one valid IP is
+        // available for web-archiver to resume. If current IP expired, get a new one.
+        if (age >= SHARED_TTL_MS) {
+            try {
+                console.log(`${TAG} [shared] idle standby: IP expired (age=${Math.round(age / 1000)}s), acquiring fresh IP for standby`);
+                currentIp = null;
+                const ip = await getSharedIp();
+                console.log(`${TAG} [shared] idle standby: fresh IP ${ip.ip}:${ip.port} ready`);
+            } catch (err: any) {
+                console.error(`${TAG} [shared] idle standby: acquire failed: ${err.message}`);
+            }
         }
         return;
     }
-    const age = currentIp ? Date.now() - currentIp.acquiredAt : Infinity;
+
+    // Active mode: proactively rotate IP before web-archiver's skip threshold
     if (age >= REFRESH_INTERVAL_MS) {
         try {
             console.log(`${TAG} [shared] proactive refresh (age=${Math.round(age / 1000)}s >= ${Math.round(REFRESH_INTERVAL_MS / 1000)}s, idle=${Math.round(idleMs / 1000)}s)`);
