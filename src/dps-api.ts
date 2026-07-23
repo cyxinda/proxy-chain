@@ -31,16 +31,16 @@ export class DpsApi {
             .replace(/\/+$/, '');
     }
 
-    async getDpsIp(): Promise<{ ip: string; port: number }> {
-        const ips = await this.getDpsIps(1);
+    async getDpsIp(area?: string): Promise<{ ip: string; port: number }> {
+        const ips = await this.getDpsIps(1, area);
         return ips[0];
     }
 
-    async getDpsIps(num: number): Promise<{ ip: string; port: number }[]> {
-        return this._getDpsIps(num, 0);
+    async getDpsIps(num: number, area?: string): Promise<{ ip: string; port: number }[]> {
+        return this._getDpsIps(num, 0, area);
     }
 
-    private async _getDpsIps(num: number, retry: number): Promise<{ ip: string; port: number }[]> {
+    private async _getDpsIps(num: number, retry: number, area?: string): Promise<{ ip: string; port: number }[]> {
         const token = await this.ensureToken();
         const url = `${this.apiEndpoint}/getdps`;
         const params = new URLSearchParams({
@@ -50,6 +50,9 @@ export class DpsApi {
             format: 'text',
             sep: '1',
         });
+        // area 指定省级行政区划代码（如 310000=上海），让 DPS 分配对应区域的 IP。
+        // 不传时 DPS 默认全国随机分配。传入无效代码时 DPS 返回错误，由调用方感知。
+        if (area) params.set('area', area);
 
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 8_000);
@@ -83,7 +86,7 @@ export class DpsApi {
                 if (retry >= 1) throw new Error(`getdps token still expired after refresh: ${truncate(text)}`);
                 console.warn(`${TAG}[${this.orderKey}] token expired, refreshing and retrying`);
                 this.secretToken = null;
-                return this._getDpsIps(num, retry + 1);
+                return this._getDpsIps(num, retry + 1, area);
             }
 
             const lines = text.split(/\n/).map(l => l.trim()).filter(Boolean);

@@ -22,6 +22,11 @@ const str = (envVal, fileVal, defaultVal) => {
   return defaultVal;
 };
 
+const bool = (envVal, fileVal, defaultVal) => {
+  const v = str(envVal, fileVal, defaultVal);
+  return v === true || v === 'true';
+};
+
 /** 从 YAML 配置文件加载 */
 function loadFileConfig() {
   const candidates = [
@@ -150,10 +155,16 @@ export const config = {
   },
   forwarder: {
     port: num(process.env.FORWARDER_PORT, file.forwarder?.port, 3128),
-    verbose: str(process.env.FORWARDER_VERBOSE, file.forwarder?.verbose, 'false') === 'true',
+    verbose: bool(process.env.FORWARDER_VERBOSE, file.forwarder?.verbose, 'false'),
     sharedTtlMs: num(process.env.SHARED_TTL_MS, file.forwarder?.sharedTtlMs, 90_000),
     sessionTtlMs: num(process.env.SESSION_TTL_MS, file.forwarder?.sessionTtlMs, 900_000),
     sessionFailureThreshold: num(process.env.SESSION_FAILURE_THRESHOLD, file.forwarder?.sessionFailureThreshold, 2),
+    // 获取 session IP 时的健康检查重试次数(失败后进入降级窗口)
+    sessionAcquireAttempts: num(process.env.SESSION_ACQUIRE_ATTEMPTS, file.forwarder?.sessionAcquireAttempts, 3),
+    // 快代理不可用时是否降级为本地直连
+    fallbackToDirect: bool(process.env.FALLBACK_TO_DIRECT, file.forwarder?.fallbackToDirect, 'true'),
+    // 降级窗口长度:进入降级后连续直连 N 毫秒,再试探恢复
+    degradedWindowMs: num(process.env.DPS_DEGRADED_WINDOW_MS, file.forwarder?.degradedWindowMs, 60_000),
   },
 };
 

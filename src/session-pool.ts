@@ -27,16 +27,23 @@ export class SessionPool {
     private dpsApi: DpsApi;
     private ttlMs: number;
     private failureThreshold: number;
+    private acquireAttempts: number;
     private sessions = new Map<string, SessionEntry>();
     private acquiring = new Map<string, Promise<SessionEntry>>(); // per-session 锁
 
-    constructor({ dpsApi, ttlMs, failureThreshold = 2 }: { dpsApi: DpsApi; ttlMs: number; failureThreshold?: number }) {
+    constructor({ dpsApi, ttlMs, failureThreshold = 2, acquireAttempts = 3 }: {
+        dpsApi: DpsApi;
+        ttlMs: number;
+        failureThreshold?: number;
+        acquireAttempts?: number;
+    }) {
         this.dpsApi = dpsApi;
         this.ttlMs = ttlMs;
         this.failureThreshold = failureThreshold;
+        this.acquireAttempts = acquireAttempts;
     }
 
-    async getOrCreate(sessionId: string, targetHost: string): Promise<SessionEntry> {
+    async getOrCreate(sessionId: string, targetHost: string, area?: string): Promise<SessionEntry> {
         const entry = this.sessions.get(sessionId);
         if (entry && !this.isExpired(entry)) {
             entry.lastRequestTime = Date.now();
@@ -48,7 +55,7 @@ export class SessionPool {
             return this.acquiring.get(sessionId)!;
         }
 
-        const promise = this.acquireWithHealthCheck(sessionId, targetHost);
+        const promise = this.acquireWithHealthCheck(sessionId, targetHost, area);
         this.acquiring.set(sessionId, promise);
         try {
             return await promise;
@@ -109,10 +116,10 @@ export class SessionPool {
 
     // ---- internals ----
 
-    private async acquireWithHealthCheck(sessionId: string, targetHost: string): Promise<SessionEntry> {
-        for (let i = 0; i < 5; i++) {
+    private async acquireWithHealthCheck(sessionId: string, targetHost: string, area?: string): Promise<SessionEntry> {
+        for (let i = 0; i < this.acquireAttempts; i++) {
             try {
-                const ip = await this.dpsApi.getDpsIp();
+                const ip = await this.dpsApi.getDpsIp(area);
                 const healthy = await this.checkHealth(ip, targetHost);
                 if (healthy) {
                     const entry = new SessionEntry(ip.ip, ip.port, targetHost, this.failureThreshold);
@@ -120,12 +127,12 @@ export class SessionPool {
                     console.log(`${TAG} ${sessionId} acquired IP ${ip.ip}:${ip.port} (attempt ${i + 1})`);
                     return entry;
                 }
-                console.warn(`${TAG} ${sessionId} health check failed for ${ip.ip}:${ip.port} (attempt ${i + 1})`);
+                console.warn(`${TAG} ${sessionId} health check failed for ${ip.ip}:${ip.port} (attempt ${i + 1}/${this.acquireAttempts})`);
             } catch (err: any) {
-                console.warn(`${TAG} ${sessionId} acquire attempt ${i + 1} failed: ${err.message}`);
+                console.warn(`${TAG} ${sessionId} acquire attempt ${i + 1}/${this.acquireAttempts} failed: ${err.message}`);
             }
         }
-        throw new Error(`${TAG} ${sessionId} failed to get healthy IP after 5 attempts`);
+        throw new Error(`${TAG} ${sessionId} failed to get healthy IP after ${this.acquireAttempts} attempts`);
     }
 
     /** 统一健康检查: CONNECT 到 target:443 */

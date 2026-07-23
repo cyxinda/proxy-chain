@@ -10,6 +10,10 @@ forwarder:
   sharedTtlMs: 90000      # 短命池 TTL 1.5min
   sessionTtlMs: 900000    # 长命池 TTL 15min
   sessionFailureThreshold: 2
+  # 快代理不可用时降级为本地直连(熔断:连续 5 次获取健康 IP 失败后进入降级窗口)
+  # 短命池(shared)和长命池(session)独立熔断,互不影响
+  fallbackToDirect: true
+  degradedWindowMs: 60000  # 降级窗口长度,窗口内直连,窗口结束后试探恢复
 
 # DPS 短命池订单
 # dpsShort:

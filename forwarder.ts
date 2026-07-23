@@ -25,6 +25,8 @@ const PORT = config.forwarder.port;
 const SHARED_TTL_MS = config.forwarder.sharedTtlMs;
 const SESSION_TTL_MS = config.forwarder.sessionTtlMs;
 const VERBOSE = config.forwarder.verbose;
+const FALLBACK_TO_DIRECT = config.forwarder.fallbackToDirect;
+const DEGRADED_WINDOW_MS = config.forwarder.degradedWindowMs;
 
 // ── DPS API ──
 
@@ -132,6 +134,7 @@ const sessionPool = new SessionPool({
     dpsApi: dpsApiLong,
     ttlMs: SESSION_TTL_MS,
     failureThreshold: config.forwarder.sessionFailureThreshold,
+    acquireAttempts: config.forwarder.sessionAcquireAttempts,
 });
 
 // ── Get local IP ──
@@ -146,6 +149,53 @@ function getLocalIp(): string {
     return '127.0.0.1';
 }
 
+// ── DPS fallback / circuit breaker ──
+// 当快代理不可用时降级为本地直连,避免请求全部失败。
+// 通过 prepareRequestFunction 返回不带 upstreamProxyUrl 的对象,
+// 让 server 走 direct() 直连(src/server.ts 中 direct 分支)。
+//
+// 短命池(shared)和长命池(session)独立熔断:一个池挂了不影响另一个。
+// 例如长命池没费用时,session 请求走直连,shared 请求继续用短命池。
+//
+// 状态机:healthy -> (5 次重试全失败) -> degraded -> (窗口过期试探)
+//   -> 成功则 healthy / 失败则继续 degraded
+// 降级窗口内不试 DPS,直接走直连,避免每个请求都等 5×4s 重试。
+
+type PoolKey = 'shared' | 'session';
+type BreakerState = { state: 'healthy' | 'degraded'; degradedUntil: number; degradedSince: number | null };
+const breakers: Record<PoolKey, BreakerState> = {
+    shared: { state: 'healthy', degradedUntil: 0, degradedSince: null },
+    session: { state: 'healthy', degradedUntil: 0, degradedSince: null },
+};
+
+function isDpsDegraded(pool: PoolKey): boolean {
+    const b = breakers[pool];
+    return b.state === 'degraded' && Date.now() < b.degradedUntil;
+}
+
+function markDpsDegraded(pool: PoolKey, reason: string): void {
+    const b = breakers[pool];
+    const wasDegraded = b.state === 'degraded';
+    b.state = 'degraded';
+    b.degradedUntil = Date.now() + DEGRADED_WINDOW_MS;
+    if (!wasDegraded) {
+        b.degradedSince = Date.now();
+        console.warn(`${TAG} [fallback] ${pool} pool degraded, switching to direct for ${DEGRADED_WINDOW_MS / 1000}s (reason: ${reason})`);
+    } else {
+        console.warn(`${TAG} [fallback] ${pool} pool still degraded, extending direct window (reason: ${reason})`);
+    }
+}
+
+function markDpsHealthy(pool: PoolKey): void {
+    const b = breakers[pool];
+    if (b.state === 'degraded') {
+        const dur = b.degradedSince ? Math.round((Date.now() - b.degradedSince) / 1000) : 0;
+        console.log(`${TAG} [fallback] ${pool} pool recovered after ${dur}s degraded, back to proxy mode`);
+        b.state = 'healthy';
+        b.degradedSince = null;
+    }
+}
+
 // ── Server ──
 
 const server = new Server({
@@ -158,25 +208,52 @@ const server = new Server({
             const target = `${hostname}:${port}`;
 
             if (!username) {
-                // Shared mode: single IP for all hosts
+                // Shared mode: single IP for all hosts (短命池)
+                // 熔断检查:短命池降级窗口内直接走直连
+                if (FALLBACK_TO_DIRECT && isDpsDegraded('shared')) {
+                    console.log(`${TAG} [direct] ${isHttp ? 'HTTP' : 'CONNECT'} ${target} (shared pool degraded, fallback to direct)`);
+                    return { customTag: { mode: 'direct' as const } };
+                }
                 const ip = await getSharedIp();
+                markDpsHealthy('shared');
                 console.log(`${TAG} [shared] ${isHttp ? 'HTTP' : 'CONNECT'} ${target} via ${ip.ip}:${ip.port}`);
                 return {
                     upstreamProxyUrl: `http://${SHORT_PROXY_USER}:${SHORT_PROXY_PASS}@${ip.ip}:${ip.port}`,
                     customTag: { mode: 'shared' as const },
                 };
             } else {
-                // Session mode: sticky IP per session
-                const entry = await sessionPool.getOrCreate(username, hostname);
-                sessionPool.touchLastRequest(username);
-                console.log(`${TAG} [session:${username}] ${isHttp ? 'HTTP' : 'CONNECT'} ${target} via ${entry.ip}:${entry.port}`);
+                // Session mode: sticky IP per session (长命池)
+                // username 格式：${sessionId} 或 ${sessionId}|${areaCode}
+                // areaCode 为省级行政区划代码（如 310000），让 DPS 分配对应区域 IP；
+                // 缺省时不指定区域，DPS 全国随机分配。
+                // 熔断检查:长命池降级窗口内直接走直连
+                if (FALLBACK_TO_DIRECT && isDpsDegraded('session')) {
+                    const sepIdx = username.indexOf('|');
+                    const sessionId = sepIdx >= 0 ? username.substring(0, sepIdx) : username;
+                    console.log(`${TAG} [direct] ${isHttp ? 'HTTP' : 'CONNECT'} ${target} (session pool degraded, fallback to direct for ${sessionId})`);
+                    return { customTag: { mode: 'direct' as const } };
+                }
+                const sepIdx = username.indexOf('|');
+                const sessionId = sepIdx >= 0 ? username.substring(0, sepIdx) : username;
+                const area = sepIdx >= 0 ? username.substring(sepIdx + 1) : undefined;
+                const entry = await sessionPool.getOrCreate(sessionId, hostname, area);
+                markDpsHealthy('session');
+                sessionPool.touchLastRequest(sessionId);
+                console.log(`${TAG} [session:${sessionId}${area ? ` area=${area}` : ''}] ${isHttp ? 'HTTP' : 'CONNECT'} ${target} via ${entry.ip}:${entry.port}`);
                 return {
                     upstreamProxyUrl: `http://${LONG_PROXY_USER}:${LONG_PROXY_PASS}@${entry.ip}:${entry.port}`,
-                    customTag: { mode: 'session' as const, id: username },
+                    customTag: { mode: 'session' as const, id: sessionId },
                 };
             }
         } catch (err: any) {
             console.error(`${TAG} prepareRequestFunction error: ${err.message}`);
+            // 开启降级时:根据当前模式进入对应池的降级窗口,本次请求走直连
+            // (窗口过期后下一次请求会自动试探 DPS 是否恢复)
+            if (FALLBACK_TO_DIRECT) {
+                const pool: PoolKey = username ? 'session' : 'shared';
+                markDpsDegraded(pool, err.message);
+                return { customTag: { mode: 'direct' as const } };
+            }
             throw err;
         }
     },
@@ -256,13 +333,20 @@ const ipRefreshTimer = setInterval(async () => {
 
     const age = currentIp ? Date.now() - currentIp.acquiredAt : Infinity;
     if (age >= REFRESH_INTERVAL_MS) {
+        // 降级期间跳过主动刷新,避免浪费 DPS 配额和噪音日志;
+        // 降级窗口结束后由 prepareRequestFunction 的按需获取试探恢复。
+        if (FALLBACK_TO_DIRECT && isDpsDegraded('shared')) {
+            return;
+        }
         try {
             console.log(`${TAG} [shared] proactive refresh (age=${Math.round(age / 1000)}s >= ${Math.round(REFRESH_INTERVAL_MS / 1000)}s, idle=${Math.round(idleMs / 1000)}s)`);
             currentIp = null;
             const ip = await getSharedIp();
+            markDpsHealthy('shared');
             console.log(`${TAG} [shared] refreshed IP ${ip.ip}:${ip.port}`);
         } catch (err: any) {
             console.error(`${TAG} [shared] proactive refresh failed: ${err.message}`);
+            if (FALLBACK_TO_DIRECT) markDpsDegraded('shared', err.message);
         }
     }
 }, Math.max(Math.floor(REFRESH_INTERVAL_MS / 2), 15_000));
@@ -276,6 +360,9 @@ const statusServer = http.createServer((req, res) => {
             ip: currentIp?.ip || null,
             port: currentIp?.port || null,
             acquiredAt: currentIp?.acquiredAt || null,
+            fallbackToDirect: FALLBACK_TO_DIRECT,
+            sharedPool: { state: breakers.shared.state, degradedUntil: breakers.shared.degradedUntil || null },
+            sessionPool: { state: breakers.session.state, degradedUntil: breakers.session.degradedUntil || null },
         }));
         return;
     }
